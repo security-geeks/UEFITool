@@ -1,267 +1,345 @@
-﻿/* ffsparser.cpp
-
-Copyright (c) 2016, Nikolaj Schlej. All rights reserved.
-This program and the accompanying materials
-are licensed and made available under the terms and conditions of the BSD License
-which accompanies this distribution.  The full text of the license may be found at
-http://opensource.org/licenses/bsd-license.php
-
-THE PROGRAM IS DISTRIBUTED UNDER THE BSD LICENSE ON AN "AS IS" BASIS,
-WITHWARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
-*/
+/* ffsparser.cpp
+ 
+ Copyright (c) 2018, Nikolaj Schlej. All rights reserved.
+ This program and the accompanying materials
+ are licensed and made available under the terms and conditions of the BSD License
+ which accompanies this distribution.  The full text of the license may be found at
+ http://opensource.org/licenses/bsd-license.php
+ 
+ THE PROGRAM IS DISTRIBUTED UNDER THE BSD LICENSE ON AN "AS IS" BASIS,
+ WITHWARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
+ */
 
 #include "ffsparser.h"
 
-#include <cmath>
+#include <map>
 #include <algorithm>
+#include <iostream>
 
-// Region info structure definition
-struct REGION_INFO {
-    UINT32 offset;
-    UINT32 length;
-    UINT8  type;
-    QByteArray data;
-    friend bool operator< (const REGION_INFO & lhs, const REGION_INFO & rhs){ return lhs.offset < rhs.offset; }
-};
+#include "descriptor.h"
+#include "ffs.h"
+#include "gbe.h"
+#include "me.h"
+#include "intel_fit.h"
+#include "nvram.h"
+#include "peimage.h"
+#include "parsingdata.h"
+#include "types.h"
+#include "utility.h"
+
+#include "nvramparser.h"
+#include "meparser.h"
+#include "fitparser.h"
+
+#include "digest/sha1.h"
+#include "digest/sha2.h"
+#include "digest/sm3.h"
+
+#include "umemstream.h"
+#include "kaitai/kaitaistream.h"
+#include "generated/insyde_fdm.h"
+
+#ifdef U_ENABLE_NVRAM_PARSING_SUPPORT
+#include "generated/dell_dvar.h"
+#endif
+
+// Constructor
+FfsParser::FfsParser(TreeModel* treeModel) : model(treeModel),
+imageBase(0), addressDiff(0x100000000ULL), protectedRegionsBase(0),
+pspSpiRomBase(0), pspMaxOffset(0) {
+    fitParser = new FitParser(treeModel, this);
+    nvramParser = new NvramParser(treeModel, this);
+    meParser = new MeParser(treeModel, this);
+}
+
+// Destructor
+FfsParser::~FfsParser() {
+    delete nvramParser;
+    delete meParser;
+    delete fitParser;
+}
+
+// Obtain parser messages
+std::vector<std::pair<UString, UModelIndex> > FfsParser::getMessages() const {
+    std::vector<std::pair<UString, UModelIndex> > meVector = meParser->getMessages();
+    std::vector<std::pair<UString, UModelIndex> > nvramVector = nvramParser->getMessages();
+    std::vector<std::pair<UString, UModelIndex> > fitVector = fitParser->getMessages();
+    std::vector<std::pair<UString, UModelIndex> > resultVector = messagesVector;
+    resultVector.insert(resultVector.end(), meVector.begin(), meVector.end());
+    resultVector.insert(resultVector.end(), nvramVector.begin(), nvramVector.end());\
+    resultVector.insert(resultVector.end(), fitVector.begin(), fitVector.end());
+    return resultVector;
+}
+
+// Obtain FIT table from FIT parser
+std::vector<std::pair<std::vector<UString>, UModelIndex> > FfsParser::getFitTable() const
+{
+    return fitParser->getFitTable();
+}
+
+// Obtain security info from FIT parser
+UString FfsParser::getSecurityInfo() const {
+    return securityInfo + fitParser->getSecurityInfo();
+}
 
 // Firmware image parsing functions
-STATUS FfsParser::parse(const QByteArray & buffer) 
+USTATUS FfsParser::parse(const UByteArray & buffer)
 {
-    QModelIndex root;
-    STATUS result = performFirstPass(buffer, root);
-    addOffsetsRecursive(root);
-    if (result)
-        return result;
-
-    if (lastVtf.isValid()) 
-        result = performSecondPass(root);
-    else 
-        msg(QObject::tr("parse: not a single Volume Top File is found, the image may be corrupted"));
-
+    UModelIndex root;
+    
+    // Reset global parser state
+    openedImage = buffer;
+    imageBase = 0;
+    addressDiff = 0x100000000ULL;
+    indexesAddressDiffs.clear();
+    pspFilesList.clear();
+    protectedRegionsBase = 0;
+    securityInfo = "";
+    protectedRanges.clear();
+    lastVtf = UModelIndex();
+    dxeCore = UModelIndex();
+    
+    // Parse input buffer
+    USTATUS result = performFirstPass(buffer, root);
+    if (result == U_SUCCESS) {
+        if (lastVtf.isValid()) {
+            result = performSecondPass(root);
+        }
+        else {
+            msg(usprintf("%s: not a single Volume Top File is found, the image may be corrupted", __FUNCTION__));
+        }
+    }
+    
+    addInfoRecursive(root);
     return result;
 }
 
-STATUS FfsParser::performFirstPass(const QByteArray & buffer, QModelIndex & index)
-{
-    // Reset capsule offset fixup value
-    capsuleOffsetFixup = 0;
-
-    // Check buffer size to be more than or equal to size of EFI_CAPSULE_HEADER
-    if ((UINT32)buffer.size() <= sizeof(EFI_CAPSULE_HEADER)) {
-        msg(QObject::tr("performFirstPass: image file is smaller than minimum size of %1h (%2) bytes").hexarg(sizeof(EFI_CAPSULE_HEADER)).arg(sizeof(EFI_CAPSULE_HEADER)));
-        return ERR_INVALID_PARAMETER;
-    }
-
-    UINT32 capsuleHeaderSize = 0;
-    // Check buffer for being normal EFI capsule header
-    if (buffer.startsWith(EFI_CAPSULE_GUID)
-        || buffer.startsWith(INTEL_CAPSULE_GUID)
-        || buffer.startsWith(LENOVO_CAPSULE_GUID)
-        || buffer.startsWith(LENOVO2_CAPSULE_GUID)) {
-        // Get info
-        const EFI_CAPSULE_HEADER* capsuleHeader = (const EFI_CAPSULE_HEADER*)buffer.constData();
-
-        // Check sanity of HeaderSize and CapsuleImageSize values
-        if (capsuleHeader->HeaderSize == 0 || capsuleHeader->HeaderSize > (UINT32)buffer.size() || capsuleHeader->HeaderSize > capsuleHeader->CapsuleImageSize) {
-            msg(QObject::tr("performFirstPass: UEFI capsule header size of %1h (%2) bytes is invalid")
-                .hexarg(capsuleHeader->HeaderSize).arg(capsuleHeader->HeaderSize));
-            return ERR_INVALID_CAPSULE;
-        }
-        if (capsuleHeader->CapsuleImageSize == 0 || capsuleHeader->CapsuleImageSize > (UINT32)buffer.size()) {
-            msg(QObject::tr("performFirstPass: UEFI capsule image size of %1h (%2) bytes is invalid")
-                .hexarg(capsuleHeader->CapsuleImageSize).arg(capsuleHeader->CapsuleImageSize));
-            return ERR_INVALID_CAPSULE;
-        }
-
-        capsuleHeaderSize = capsuleHeader->HeaderSize;
-        QByteArray header = buffer.left(capsuleHeaderSize);
-        QByteArray body = buffer.mid(capsuleHeaderSize);
-        QString name = QObject::tr("UEFI capsule");
-        QString info = QObject::tr("Capsule GUID: %1\nFull size: %2h (%3)\nHeader size: %4h (%5)\nImage size: %6h (%7)\nFlags: %8h")
-            .arg(guidToQString(capsuleHeader->CapsuleGuid))
-            .hexarg(buffer.size()).arg(buffer.size())
-            .hexarg(capsuleHeaderSize).arg(capsuleHeaderSize)
-            .hexarg(capsuleHeader->CapsuleImageSize - capsuleHeaderSize).arg(capsuleHeader->CapsuleImageSize - capsuleHeaderSize)
-            .hexarg2(capsuleHeader->Flags, 8);
-
-        // Set capsule offset fixup for correct volume allignment warnings
-        capsuleOffsetFixup = capsuleHeaderSize;
-
-        // Add tree item
-        index = model->addItem(Types::Capsule, Subtypes::UefiCapsule, name, QString(), info, header, body, QByteArray(), true);
-    }
-    // Check buffer for being Toshiba capsule header
-    else if (buffer.startsWith(TOSHIBA_CAPSULE_GUID)) {
-        // Get info
-        const TOSHIBA_CAPSULE_HEADER* capsuleHeader = (const TOSHIBA_CAPSULE_HEADER*)buffer.constData();
-
-        // Check sanity of HeaderSize and FullSize values
-        if (capsuleHeader->HeaderSize == 0 || capsuleHeader->HeaderSize > (UINT32)buffer.size() || capsuleHeader->HeaderSize > capsuleHeader->FullSize) {
-            msg(QObject::tr("performFirstPass: Toshiba capsule header size of %1h (%2) bytes is invalid")
-                .hexarg(capsuleHeader->HeaderSize).arg(capsuleHeader->HeaderSize));
-            return ERR_INVALID_CAPSULE;
-        }
-        if (capsuleHeader->FullSize == 0 || capsuleHeader->FullSize > (UINT32)buffer.size()) {
-            msg(QObject::tr("performFirstPass: Toshiba capsule full size of %1h (%2) bytes is invalid")
-                .hexarg(capsuleHeader->FullSize).arg(capsuleHeader->FullSize));
-            return ERR_INVALID_CAPSULE;
-        }
-
-        capsuleHeaderSize = capsuleHeader->HeaderSize;
-        QByteArray header = buffer.left(capsuleHeaderSize);
-        QByteArray body = buffer.right(buffer.size() - capsuleHeaderSize);
-        QString name = QObject::tr("Toshiba capsule");
-        QString info = QObject::tr("Capsule GUID: %1\nFull size: %2h (%3)\nHeader size: %4h (%5)\nImage size: %6h (%7)\nFlags: %8h")
-            .arg(guidToQString(capsuleHeader->CapsuleGuid))
-            .hexarg(buffer.size()).arg(buffer.size())
-            .hexarg(capsuleHeaderSize).arg(capsuleHeaderSize)
-            .hexarg(capsuleHeader->FullSize - capsuleHeaderSize).arg(capsuleHeader->FullSize - capsuleHeaderSize)
-            .hexarg2(capsuleHeader->Flags, 8);
-
-        // Set capsule offset fixup for correct volume allignment warnings
-        capsuleOffsetFixup = capsuleHeaderSize;
-
-        // Add tree item
-        index = model->addItem(Types::Capsule, Subtypes::ToshibaCapsule, name, QString(), info, header, body, QByteArray(), true);
-    }
-    // Check buffer for being extended Aptio capsule header
-    else if (buffer.startsWith(APTIO_SIGNED_CAPSULE_GUID) || buffer.startsWith(APTIO_UNSIGNED_CAPSULE_GUID)) {
-        bool signedCapsule = buffer.startsWith(APTIO_SIGNED_CAPSULE_GUID);
-
-        if ((UINT32)buffer.size() <= sizeof(APTIO_CAPSULE_HEADER)) {
-            msg(QObject::tr("performFirstPass: AMI capsule image file is smaller than minimum size of %1h (%2) bytes").hexarg(sizeof(APTIO_CAPSULE_HEADER)).arg(sizeof(APTIO_CAPSULE_HEADER)));
-            return ERR_INVALID_PARAMETER;
-        }
-
-        // Get info
-        const APTIO_CAPSULE_HEADER* capsuleHeader = (const APTIO_CAPSULE_HEADER*)buffer.constData();
-
-        // Check sanity of RomImageOffset and CapsuleImageSize values
-        if (capsuleHeader->RomImageOffset == 0 || capsuleHeader->RomImageOffset > (UINT32)buffer.size() || capsuleHeader->RomImageOffset > capsuleHeader->CapsuleHeader.CapsuleImageSize) {
-            msg(QObject::tr("performFirstPass: AMI capsule image offset of %1h (%2) bytes is invalid").hexarg(capsuleHeader->RomImageOffset).arg(capsuleHeader->RomImageOffset));
-            return ERR_INVALID_CAPSULE;
-        }
-        if (capsuleHeader->CapsuleHeader.CapsuleImageSize == 0 || capsuleHeader->CapsuleHeader.CapsuleImageSize > (UINT32)buffer.size()) {
-            msg(QObject::tr("performFirstPass: AMI capsule image size of %1h (%2) bytes is invalid").hexarg(capsuleHeader->CapsuleHeader.CapsuleImageSize).arg(capsuleHeader->CapsuleHeader.CapsuleImageSize));
-            return ERR_INVALID_CAPSULE;
-        }
-
-        capsuleHeaderSize = capsuleHeader->RomImageOffset;
-        QByteArray header = buffer.left(capsuleHeaderSize);
-        QByteArray body = buffer.mid(capsuleHeaderSize);
-        QString name = QObject::tr("AMI Aptio capsule");
-        QString info = QObject::tr("Capsule GUID: %1\nFull size: %2h (%3)\nHeader size: %4h (%5)\nImage size: %6h (%7)\nFlags: %8h")
-            .arg(guidToQString(capsuleHeader->CapsuleHeader.CapsuleGuid))
-            .hexarg(buffer.size()).arg(buffer.size())
-            .hexarg(capsuleHeaderSize).arg(capsuleHeaderSize)
-            .hexarg(capsuleHeader->CapsuleHeader.CapsuleImageSize - capsuleHeaderSize).arg(capsuleHeader->CapsuleHeader.CapsuleImageSize - capsuleHeaderSize)
-            .hexarg2(capsuleHeader->CapsuleHeader.Flags, 8);
-
-        // Set capsule offset fixup for correct volume allignment warnings
-        capsuleOffsetFixup = capsuleHeaderSize;
-
-        // Add tree item
-        index = model->addItem(Types::Capsule, signedCapsule ? Subtypes::AptioSignedCapsule : Subtypes::AptioUnsignedCapsule, name, QString(), info, header, body, QByteArray(), true);
-
-        // Show message about possible Aptio signature break
-        if (signedCapsule) {
-            msg(QObject::tr("performFirstPass: Aptio capsule signature may become invalid after image modifications"), index);
-        }
-    }
-
-    // Skip capsule header to have flash chip image
-    QByteArray flashImage = buffer.mid(capsuleHeaderSize);
-
-    // Check for Intel flash descriptor presence
-    const FLASH_DESCRIPTOR_HEADER* descriptorHeader = (const FLASH_DESCRIPTOR_HEADER*)flashImage.constData();
-
-    // Check descriptor signature
-    STATUS result;
-    if (descriptorHeader->Signature == FLASH_DESCRIPTOR_SIGNATURE) {
-        // Parse as Intel image
-        QModelIndex imageIndex;
-        result = parseIntelImage(flashImage, capsuleHeaderSize, index, imageIndex);
-        if (result != ERR_INVALID_FLASH_DESCRIPTOR) {
-            if (!index.isValid())
-                index = imageIndex;
-            return result;
-        }
-    }
-
-    // Get info
-    QString name = QObject::tr("UEFI image");
-    QString info = QObject::tr("Full size: %1h (%2)").hexarg(flashImage.size()).arg(flashImage.size());
-
-    // Construct parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-    pdata.offset = capsuleHeaderSize;
-
-    // Add tree item
-    QModelIndex biosIndex = model->addItem(Types::Image, Subtypes::UefiImage, name, QString(), info, QByteArray(), flashImage, QByteArray(), true, parsingDataToQByteArray(pdata), index);
-
-    // Parse the image
-    result = parseRawArea(biosIndex);
-    if (!index.isValid())
-        index = biosIndex;
-    return result;
-}
-
-STATUS FfsParser::parseIntelImage(const QByteArray & intelImage, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+USTATUS FfsParser::performFirstPass(const UByteArray & buffer, UModelIndex & index)
 {
     // Sanity check
-    if (intelImage.isEmpty())
-        return EFI_INVALID_PARAMETER;
+    if (buffer.isEmpty()) {
+        return U_INVALID_PARAMETER;
+    }
+    
+    // Try parsing as UEFI Capsule
+    if (U_SUCCESS == parseCapsule(buffer, 0, UModelIndex(), index)) {
+        return U_SUCCESS;
+    }
+    // Try parsing as some image
+    return parseImage(buffer, 0, UModelIndex(), index);
+}
+    
+USTATUS FfsParser::parseImage(const UByteArray& buffer, const UINT32 localOffset, const UModelIndex& parent, UModelIndex& index)
+{
+    // Try parsing as Intel image
+    USTATUS result = parseIntelImage(buffer, localOffset, parent, index);
+    if (U_SUCCESS != result) {
+        result = parseGenericImage(buffer, localOffset, parent, index);
+        
+        // TODO: re-enable once AMD parser will be fixed to uphold the base-offset-size pre- and post-conditions
+        // Try parsing as AMD image
+        //result = parseAMDImage(buffer, localOffset, parent, index);
+        //if (U_SUCCESS != result) {
+        //    // Parse as generic UEFI image or file
+        //    result = parseGenericImage(buffer, localOffset, parent, index);
+        //}
+    }
+    
+    return result;
+}
 
-    // Get parent's parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
+USTATUS FfsParser::parseGenericImage(const UByteArray & buffer, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index)
+{
+    // Parse as generic UEFI image
+    UString name("UEFI image");
+    
+    // Add tree item
+    index = model->addItem(localOffset, Types::Image, Subtypes::UefiImage, name, UString(), UString(), UByteArray(), buffer, UByteArray(), Fixed, parent);
+    
+    // Parse the image as raw area
+    imageBase = model->base(parent) + localOffset;
+    protectedRegionsBase = imageBase;
+    return parseRawArea(index);
+}
 
-    // Store the beginning of descriptor as descriptor base address
-    const UINT8* descriptor = (const UINT8*)intelImage.constData();
+USTATUS FfsParser::parseCapsule(const UByteArray & capsule, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index)
+{
+    // Check buffer size to be more than or equal to size of EFI_CAPSULE_HEADER
+    if ((UINT32)capsule.size() < sizeof(EFI_CAPSULE_HEADER)) {
+        return U_ITEM_NOT_FOUND;
+    }
+    
+    UINT32 capsuleHeaderSize = 0;
+    // Check buffer for being normal EFI capsule header
+    if (capsule.startsWith(EFI_CAPSULE_GUID)
+        || capsule.startsWith(EFI_FMP_CAPSULE_GUID)
+        || capsule.startsWith(INTEL_CAPSULE_GUID)
+        || capsule.startsWith(LENOVO_CAPSULE_GUID)
+        || capsule.startsWith(LENOVO2_CAPSULE_GUID)) {
+        // Get info
+        const EFI_CAPSULE_HEADER* capsuleHeader = (const EFI_CAPSULE_HEADER*)capsule.constData();
+        
+        // Check sanity of HeaderSize and CapsuleImageSize values
+        if (capsuleHeader->HeaderSize == 0 || capsuleHeader->HeaderSize > (UINT32)capsule.size()
+            || capsuleHeader->HeaderSize > capsuleHeader->CapsuleImageSize) {
+            msg(usprintf("%s: UEFI capsule header size of %Xh (%u) bytes is invalid", __FUNCTION__,
+                         capsuleHeader->HeaderSize,
+                         capsuleHeader->HeaderSize));
+            return U_INVALID_CAPSULE;
+        }
+        if (capsuleHeader->CapsuleImageSize > (UINT32)capsule.size()) {
+            msg(usprintf("%s: UEFI capsule image size of %Xh (%u) bytes is invalid", __FUNCTION__,
+                         capsuleHeader->CapsuleImageSize,
+                         capsuleHeader->CapsuleImageSize));
+            return U_INVALID_CAPSULE;
+        }
+        
+        capsuleHeaderSize = capsuleHeader->HeaderSize;
+        UByteArray header = capsule.left(capsuleHeaderSize);
+        UByteArray body = capsule.mid(capsuleHeaderSize);
+        UString name("UEFI capsule");
+        UString info = UString("Capsule GUID: ") + guidToUString(capsuleHeader->CapsuleGuid, false) +
+        usprintf("\nImage size: %Xh (%u)\nFlags: %08Xh",
+                 capsuleHeader->CapsuleImageSize - capsuleHeaderSize, capsuleHeader->CapsuleImageSize - capsuleHeaderSize,
+                 capsuleHeader->Flags);
+        
+        // Add tree item
+        index = model->addItem(localOffset, Types::Capsule, Subtypes::UefiCapsule, name, UString(), info, header, body, UByteArray(), Fixed, parent);
+    }
+    // Check buffer for being Toshiba capsule header
+    else if (capsule.startsWith(TOSHIBA_CAPSULE_GUID)) {
+        // Get info
+        const TOSHIBA_CAPSULE_HEADER* capsuleHeader = (const TOSHIBA_CAPSULE_HEADER*)capsule.constData();
+        
+        // Check sanity of HeaderSize and FullSize values
+        if (capsuleHeader->HeaderSize == 0 || capsuleHeader->HeaderSize > (UINT32)capsule.size()
+            || capsuleHeader->HeaderSize > capsuleHeader->FullSize) {
+            msg(usprintf("%s: Toshiba capsule header size of %Xh (%u) bytes is invalid", __FUNCTION__,
+                         capsuleHeader->HeaderSize, capsuleHeader->HeaderSize));
+            return U_INVALID_CAPSULE;
+        }
+        if (capsuleHeader->FullSize > (UINT32)capsule.size()) {
+            msg(usprintf("%s: Toshiba capsule full size of %Xh (%u) bytes is invalid", __FUNCTION__,
+                         capsuleHeader->FullSize, capsuleHeader->FullSize));
+            return U_INVALID_CAPSULE;
+        }
+        
+        capsuleHeaderSize = capsuleHeader->HeaderSize;
+        UByteArray header = capsule.left(capsuleHeaderSize);
+        UByteArray body = capsule.mid(capsuleHeaderSize);
+        UString name("Toshiba capsule");
+        UString info = UString("Capsule GUID: ") + guidToUString(capsuleHeader->CapsuleGuid, false) +
+        usprintf("\nImage size: %Xh (%u)\nFlags: %08Xh",
+                 capsuleHeader->FullSize - capsuleHeaderSize, capsuleHeader->FullSize - capsuleHeaderSize,
+                 capsuleHeader->Flags);
+        
+        // Add tree item
+        index = model->addItem(localOffset, Types::Capsule, Subtypes::ToshibaCapsule, name, UString(), info, header, body, UByteArray(), Fixed, parent);
+    }
+    // Check buffer for being extended Aptio capsule header
+    else if (capsule.startsWith(APTIO_SIGNED_CAPSULE_GUID)
+             || capsule.startsWith(APTIO_UNSIGNED_CAPSULE_GUID)) {
+        bool signedCapsule = capsule.startsWith(APTIO_SIGNED_CAPSULE_GUID);
+        
+        if ((UINT32)capsule.size() <= sizeof(APTIO_CAPSULE_HEADER)) {
+            msg(usprintf("%s: AMI capsule image file is smaller than minimum size of 20h (32) bytes", __FUNCTION__));
+            return U_INVALID_CAPSULE;
+        }
+        
+        // Get info
+        const APTIO_CAPSULE_HEADER* capsuleHeader = (const APTIO_CAPSULE_HEADER*)capsule.constData();
+        
+        // Check sanity of RomImageOffset and CapsuleImageSize values
+        if (capsuleHeader->RomImageOffset == 0 || capsuleHeader->RomImageOffset > (UINT32)capsule.size()
+            || capsuleHeader->RomImageOffset > capsuleHeader->CapsuleHeader.CapsuleImageSize) {
+            msg(usprintf("%s: AMI capsule image offset of %Xh (%u) bytes is invalid", __FUNCTION__,
+                         capsuleHeader->RomImageOffset, capsuleHeader->RomImageOffset));
+            return U_INVALID_CAPSULE;
+        }
+        if (capsuleHeader->CapsuleHeader.CapsuleImageSize > (UINT32)capsule.size()) {
+            msg(usprintf("%s: AMI capsule image size of %Xh (%u) bytes is invalid", __FUNCTION__,
+                         capsuleHeader->CapsuleHeader.CapsuleImageSize,
+                         capsuleHeader->CapsuleHeader.CapsuleImageSize));
+            return U_INVALID_CAPSULE;
+        }
+        
+        capsuleHeaderSize = capsuleHeader->RomImageOffset;
+        UByteArray header = capsule.left(capsuleHeaderSize);
+        UByteArray body = capsule.mid(capsuleHeaderSize);
+        UString name("AMI Aptio capsule");
+        UString info = UString("Capsule GUID: ") + guidToUString(capsuleHeader->CapsuleHeader.CapsuleGuid, false) +
+        usprintf("\nImage size: %Xh (%u)\nFlags: %08Xh",
+                 capsuleHeader->CapsuleHeader.CapsuleImageSize - capsuleHeaderSize, capsuleHeader->CapsuleHeader.CapsuleImageSize - capsuleHeaderSize,
+                 capsuleHeader->CapsuleHeader.Flags);
+        
+        // Add tree item
+        index = model->addItem(localOffset, Types::Capsule, signedCapsule ? Subtypes::AptioSignedCapsule : Subtypes::AptioUnsignedCapsule, name, UString(), info, header, body, UByteArray(), Fixed, parent);
+        
+        // Show message about possible Aptio signature break
+        if (signedCapsule) {
+            msg(usprintf("%s: Aptio capsule signature may become invalid after image modifications", __FUNCTION__), index);
+        }
+    }
+    
+    // Capsule present
+    if (capsuleHeaderSize > 0) {
+        UModelIndex imageIndex;
+        
+        // Try parsing as some image
+        return parseImage(capsule.mid(capsuleHeaderSize), capsuleHeaderSize, index, imageIndex);
+    }
+    
+    return U_ITEM_NOT_FOUND;
+}
 
+USTATUS FfsParser::parseIntelImage(const UByteArray & intelImage, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index)
+{
     // Check for buffer size to be greater or equal to descriptor region size
     if (intelImage.size() < FLASH_DESCRIPTOR_SIZE) {
-        msg(QObject::tr("parseIntelImage: input file is smaller than minimum descriptor size of %1h (%2) bytes").hexarg(FLASH_DESCRIPTOR_SIZE).arg(FLASH_DESCRIPTOR_SIZE));
-        return ERR_INVALID_FLASH_DESCRIPTOR;
+        msg(usprintf("%s: input file is smaller than minimum descriptor size of %Xh (%u) bytes", __FUNCTION__, FLASH_DESCRIPTOR_SIZE, FLASH_DESCRIPTOR_SIZE));
+        return U_ITEM_NOT_FOUND;
     }
-
+    
+    // Store the beginning of descriptor as descriptor base address
+    const FLASH_DESCRIPTOR_HEADER* descriptor = (const FLASH_DESCRIPTOR_HEADER*)intelImage.constData();
+    
+    // Check descriptor signature
+    if (descriptor->Signature != FLASH_DESCRIPTOR_SIGNATURE) {
+        return U_ITEM_NOT_FOUND;
+    }
+    
     // Parse descriptor map
-    const FLASH_DESCRIPTOR_MAP* descriptorMap = (const FLASH_DESCRIPTOR_MAP*)(descriptor + sizeof(FLASH_DESCRIPTOR_HEADER));
-    const FLASH_DESCRIPTOR_UPPER_MAP* upperMap = (const FLASH_DESCRIPTOR_UPPER_MAP*)(descriptor + FLASH_DESCRIPTOR_UPPER_MAP_BASE);
-
+    const FLASH_DESCRIPTOR_MAP* descriptorMap = (const FLASH_DESCRIPTOR_MAP*)((UINT8*)descriptor + sizeof(FLASH_DESCRIPTOR_HEADER));
+    const FLASH_DESCRIPTOR_UPPER_MAP* upperMap = (const FLASH_DESCRIPTOR_UPPER_MAP*)((UINT8*)descriptor + FLASH_DESCRIPTOR_UPPER_MAP_BASE);
+    
     // Check sanity of base values
     if (descriptorMap->MasterBase > FLASH_DESCRIPTOR_MAX_BASE
         || descriptorMap->MasterBase == descriptorMap->RegionBase
         || descriptorMap->MasterBase == descriptorMap->ComponentBase) {
-        msg(QObject::tr("parseIntelImage: invalid descriptor master base %1h").hexarg2(descriptorMap->MasterBase, 2));
-        return ERR_INVALID_FLASH_DESCRIPTOR;
+        msg(usprintf("%s: invalid descriptor master base %02Xh", __FUNCTION__, descriptorMap->MasterBase));
+        return U_INVALID_FLASH_DESCRIPTOR;
     }
     if (descriptorMap->RegionBase > FLASH_DESCRIPTOR_MAX_BASE
         || descriptorMap->RegionBase == descriptorMap->ComponentBase) {
-        msg(QObject::tr("parseIntelImage: invalid descriptor region base %1h").hexarg2(descriptorMap->RegionBase, 2));
-        return ERR_INVALID_FLASH_DESCRIPTOR;
+        msg(usprintf("%s: invalid descriptor region base %02Xh", __FUNCTION__, descriptorMap->RegionBase));
+        return U_INVALID_FLASH_DESCRIPTOR;
     }
     if (descriptorMap->ComponentBase > FLASH_DESCRIPTOR_MAX_BASE) {
-        msg(QObject::tr("parseIntelImage: invalid descriptor component base %1h").hexarg2(descriptorMap->ComponentBase, 2));
-        return ERR_INVALID_FLASH_DESCRIPTOR;
+        msg(usprintf("%s: invalid descriptor component base %02Xh", __FUNCTION__, descriptorMap->ComponentBase));
+        return U_INVALID_FLASH_DESCRIPTOR;
     }
-
-    const FLASH_DESCRIPTOR_REGION_SECTION* regionSection = (const FLASH_DESCRIPTOR_REGION_SECTION*)calculateAddress8(descriptor, descriptorMap->RegionBase);
-    const FLASH_DESCRIPTOR_COMPONENT_SECTION* componentSection = (const FLASH_DESCRIPTOR_COMPONENT_SECTION*)calculateAddress8(descriptor, descriptorMap->ComponentBase);
-
-    // Check descriptor version by getting hardcoded value of FlashParameters.ReadClockFrequency
-    UINT8 descriptorVersion = 0;
-    if (componentSection->FlashParameters.ReadClockFrequency == FLASH_FREQUENCY_20MHZ)      // Old descriptor
+    
+    const FLASH_DESCRIPTOR_REGION_SECTION* regionSection = (const FLASH_DESCRIPTOR_REGION_SECTION*)calculateAddress8((UINT8*)descriptor, descriptorMap->RegionBase);
+    const FLASH_DESCRIPTOR_COMPONENT_SECTION* componentSection = (const FLASH_DESCRIPTOR_COMPONENT_SECTION*)calculateAddress8((UINT8*)descriptor, descriptorMap->ComponentBase);
+    
+    UINT8 descriptorVersion = 2;
+    // Check descriptor version by getting hardcoded value of zero in FlashParameters.ReadClockFrequency
+    if (componentSection->FlashParameters.ReadClockFrequency == 0)
         descriptorVersion = 1;
-    else if (componentSection->FlashParameters.ReadClockFrequency == FLASH_FREQUENCY_17MHZ) // Skylake+ descriptor
-        descriptorVersion = 2;
-    else {
-        msg(QObject::tr("parseIntelImage: unknown descriptor version with ReadClockFrequency %1h").hexarg(componentSection->FlashParameters.ReadClockFrequency));
-        return ERR_INVALID_FLASH_DESCRIPTOR;
-    }
-
+    
     // Regions
     std::vector<REGION_INFO> regions;
-
+    
     // ME region
     REGION_INFO me;
     me.type = Subtypes::MeRegion;
@@ -270,143 +348,108 @@ STATUS FfsParser::parseIntelImage(const QByteArray & intelImage, const UINT32 pa
     if (regionSection->MeLimit) {
         me.offset = calculateRegionOffset(regionSection->MeBase);
         me.length = calculateRegionSize(regionSection->MeBase, regionSection->MeLimit);
-        me.data = intelImage.mid(me.offset, me.length);
-        regions.push_back(me);
+        if (me.offset + me.length < me.offset) {
+            return U_INVALID_FLASH_DESCRIPTOR;
+        }
+        if ((UINT32)intelImage.size() < me.offset + me.length) {
+            msg(usprintf("%s: ", __FUNCTION__)
+                + itemSubtypeToUString(Types::Region, me.type)
+                + UString(" region is located outside of the opened image. If your system uses dual-chip storage, please append another part to the opened image"),
+                index);
+            if ((UINT32)intelImage.size() > me.offset)
+                return U_TRUNCATED_IMAGE;
+        }
+        else {
+            me.data = intelImage.mid(me.offset, me.length);
+            regions.push_back(me);
+        }
     }
-
+    
     // BIOS region
-    REGION_INFO bios;
-    bios.type = Subtypes::BiosRegion;
-    bios.offset = 0;
-    bios.length = 0;
     if (regionSection->BiosLimit) {
+        REGION_INFO bios;
+        bios.type = Subtypes::BiosRegion;
         bios.offset = calculateRegionOffset(regionSection->BiosBase);
         bios.length = calculateRegionSize(regionSection->BiosBase, regionSection->BiosLimit);
-
+        
         // Check for Gigabyte specific descriptor map
         if (bios.length == (UINT32)intelImage.size()) {
             if (!me.offset) {
-                msg(QObject::tr("parseIntelImage: can't determine BIOS region start from Gigabyte-specific descriptor"));
-                return ERR_INVALID_FLASH_DESCRIPTOR;
+                msg(usprintf("%s: can't determine BIOS region start from Gigabyte-specific descriptor", __FUNCTION__));
+                return U_INVALID_FLASH_DESCRIPTOR;
             }
             // Use ME region end as BIOS region offset
             bios.offset = me.offset + me.length;
             bios.length = (UINT32)intelImage.size() - bios.offset;
-            bios.data = intelImage.mid(bios.offset, bios.length);
-        }
-        // Normal descriptor map
-        else {
-            bios.data = intelImage.mid(bios.offset, bios.length);
         }
 
-        regions.push_back(bios);
+        if ((UINT32)intelImage.size() < bios.offset + bios.length) {
+            msg(usprintf("%s: ", __FUNCTION__)
+                + itemSubtypeToUString(Types::Region, bios.type)
+                + UString(" region is located outside of the opened image. If your system uses dual-chip storage, please append another part to the opened image"),
+                index);
+            return U_TRUNCATED_IMAGE;
+        }
+
+        if (intelImage.size() > bios.offset) {
+            bios.data = intelImage.mid(bios.offset, bios.length);
+            regions.push_back(bios);
+        }
     }
     else {
-        msg(QObject::tr("parseIntelImage: descriptor parsing failed, BIOS region not found in descriptor"));
-        return ERR_INVALID_FLASH_DESCRIPTOR;
+        msg(usprintf("%s: descriptor parsing failed, BIOS region not found in descriptor", __FUNCTION__));
+        return U_INVALID_FLASH_DESCRIPTOR;
     }
-
-    // GbE region
-    REGION_INFO gbe;
-    gbe.type = Subtypes::GbeRegion;
-    gbe.offset = 0;
-    gbe.length = 0;
-    if (regionSection->GbeLimit) {
-        gbe.offset = calculateRegionOffset(regionSection->GbeBase);
-        gbe.length = calculateRegionSize(regionSection->GbeBase, regionSection->GbeLimit);
-        gbe.data = intelImage.mid(gbe.offset, gbe.length);
-        regions.push_back(gbe);
-    }
-
-    // PDR region
-    REGION_INFO pdr;
-    pdr.type = Subtypes::PdrRegion;
-    pdr.offset = 0;
-    pdr.length = 0;
-    if (regionSection->PdrLimit) {
-        pdr.offset = calculateRegionOffset(regionSection->PdrBase);
-        pdr.length = calculateRegionSize(regionSection->PdrBase, regionSection->PdrLimit);
-        pdr.data = intelImage.mid(pdr.offset, pdr.length);
-        regions.push_back(pdr);
-    }
-
-    // Reserved1 region
-    REGION_INFO reserved1;
-    reserved1.type = Subtypes::Reserved1Region;
-    reserved1.offset = 0;
-    reserved1.length = 0;
-    if (regionSection->Reserved1Limit && regionSection->Reserved1Base != 0xFFFF && regionSection->Reserved1Limit != 0xFFFF) {
-        reserved1.offset = calculateRegionOffset(regionSection->Reserved1Base);
-        reserved1.length = calculateRegionSize(regionSection->Reserved1Base, regionSection->Reserved1Limit);
-        reserved1.data = intelImage.mid(reserved1.offset, reserved1.length);
-        regions.push_back(reserved1);
-    }
-
-    // Reserved2 region
-    REGION_INFO reserved2;
-    reserved2.type = Subtypes::Reserved2Region;
-    reserved2.offset = 0;
-    reserved2.length = 0;
-    if (regionSection->Reserved2Limit && regionSection->Reserved2Base != 0xFFFF && regionSection->Reserved2Limit != 0xFFFF) {
-        reserved2.offset = calculateRegionOffset(regionSection->Reserved2Base);
-        reserved2.length = calculateRegionSize(regionSection->Reserved2Base, regionSection->Reserved2Limit);
-        reserved2.data = intelImage.mid(reserved2.offset, reserved2.length);
-        regions.push_back(reserved2);
-    }
-
-    // Reserved3 region
-    REGION_INFO reserved3;
-    reserved3.type = Subtypes::Reserved3Region;
-    reserved3.offset = 0;
-    reserved3.length = 0;
-
-    // EC region
-    REGION_INFO ec;
-    ec.type = Subtypes::EcRegion;
-    ec.offset = 0;
-    ec.length = 0;
-
-    // Reserved4 region
-    REGION_INFO reserved4;
-    reserved3.type = Subtypes::Reserved4Region;
-    reserved4.offset = 0;
-    reserved4.length = 0;
-
-    // Check for EC and reserved region 4 only for v2 descriptor
-    if (descriptorVersion == 2) {
-        if (regionSection->Reserved3Limit) {
-            reserved3.offset = calculateRegionOffset(regionSection->Reserved3Base);
-            reserved3.length = calculateRegionSize(regionSection->Reserved3Base, regionSection->Reserved3Limit);
-            reserved3.data = intelImage.mid(reserved3.offset, reserved3.length);
-            regions.push_back(reserved3);
-        }
-
-        if (regionSection->EcLimit) {
-            ec.offset = calculateRegionOffset(regionSection->EcBase);
-            ec.length = calculateRegionSize(regionSection->EcBase, regionSection->EcLimit);
-            ec.data = intelImage.mid(ec.offset, ec.length);
-            regions.push_back(ec);
-        }
     
-        if (regionSection->Reserved4Limit) {
-            reserved4.offset = calculateRegionOffset(regionSection->Reserved4Base);
-            reserved4.length = calculateRegionSize(regionSection->Reserved4Base, regionSection->Reserved4Limit);
-            reserved4.data = intelImage.mid(reserved4.offset, reserved4.length);
-            regions.push_back(reserved4);
+    // Add all other regions
+    for (UINT8 i = Subtypes::GbeRegion; i <= Subtypes::PttRegion; i++) {
+        if (descriptorVersion == 1 && i == Subtypes::MicrocodeRegion)
+            break; // Do not parse Microcode and other following regions for legacy descriptors
+        
+        const UINT16* RegionBase = ((const UINT16*)regionSection) + 2 * i;
+        const UINT16* RegionLimit = ((const UINT16*)regionSection) + 2 * i + 1;
+        if (*RegionLimit && !(*RegionBase == 0xFFFF && *RegionLimit == 0xFFFF)) {
+            REGION_INFO region;
+            region.type = i;
+            region.offset = calculateRegionOffset(*RegionBase);
+            region.length = calculateRegionSize(*RegionBase, *RegionLimit);
+            if (region.length != 0) {
+                if ((UINT32)intelImage.size() < region.offset + region.length) {
+                    msg(usprintf("%s: ", __FUNCTION__)
+                        + itemSubtypeToUString(Types::Region, region.type)
+                        + UString(" region is located outside of the opened image. If your system uses dual-chip storage, please append another part to the opened image"),
+                        index);
+                    return U_TRUNCATED_IMAGE;
+                }
+
+                if (intelImage.size() > region.offset) {
+                    region.data = intelImage.mid(region.offset, region.length);
+                    regions.push_back(region);
+                }
+            }
         }
     }
-
+    
+    // Regions can not be empty here
+    if (regions.empty()) {
+        msg(usprintf("%s: descriptor parsing failed, no regions found", __FUNCTION__));
+        return U_INVALID_FLASH_DESCRIPTOR;
+    }
+    
     // Sort regions in ascending order
     std::sort(regions.begin(), regions.end());
-
+    
     // Check for intersections and paddings between regions
     REGION_INFO region;
     // Check intersection with the descriptor
     if (regions.front().offset < FLASH_DESCRIPTOR_SIZE) {
-        msg(QObject::tr("parseIntelImage: %1 region has intersection with flash descriptor").arg(itemSubtypeToQString(Types::Region, regions.front().type)), index);
-        return ERR_INVALID_FLASH_DESCRIPTOR;
+        msg(usprintf("%s: ", __FUNCTION__)
+            + itemSubtypeToUString(Types::Region, regions.front().type)
+            + UString(" region has intersection with flash descriptor"),
+            index);
+        return U_INVALID_FLASH_DESCRIPTOR;
     }
-    // Check for padding between descriptor and the first region 
+    // Check for padding between descriptor and the first region
     else if (regions.front().offset > FLASH_DESCRIPTOR_SIZE) {
         region.offset = FLASH_DESCRIPTOR_SIZE;
         region.length = regions.front().offset - FLASH_DESCRIPTOR_SIZE;
@@ -417,19 +460,14 @@ STATUS FfsParser::parseIntelImage(const QByteArray & intelImage, const UINT32 pa
     // Check for intersections/paddings between regions
     for (size_t i = 1; i < regions.size(); i++) {
         UINT32 previousRegionEnd = regions[i-1].offset + regions[i-1].length;
-        // Check that current region is fully present in the image
-        if (regions[i].offset + regions[i].length > (UINT32)intelImage.size()) {
-            msg(QObject::tr("parseIntelImage: %1 region is located outside of opened image, if your system uses dual-chip storage, please append another part to the opened image")
-                .arg(itemSubtypeToQString(Types::Region, regions[i].type)), index);
-            return ERR_TRUNCATED_IMAGE;
-        }
-
         // Check for intersection with previous region
         if (regions[i].offset < previousRegionEnd) {
-            msg(QObject::tr("parseIntelImage: %1 region has intersection with %2 region")
-                .arg(itemSubtypeToQString(Types::Region, regions[i].type))
-                .arg(itemSubtypeToQString(Types::Region, regions[i-1].type)), index);
-            return ERR_INVALID_FLASH_DESCRIPTOR;
+            msg(usprintf("%s: ", __FUNCTION__)
+                + itemSubtypeToUString(Types::Region, regions[i].type)
+                + UString(" region has intersection with ") + itemSubtypeToUString(Types::Region, regions[i - 1].type)
+                + UString(" region"),
+                index);
+            return U_INVALID_FLASH_DESCRIPTOR;
         }
         // Check for padding between current and previous regions
         else if (regions[i].offset > previousRegionEnd) {
@@ -438,559 +476,884 @@ STATUS FfsParser::parseIntelImage(const QByteArray & intelImage, const UINT32 pa
             region.data = intelImage.mid(region.offset, region.length);
             region.type = getPaddingType(region.data);
             std::vector<REGION_INFO>::iterator iter = regions.begin();
-            std::advance(iter, i - 1);
+            std::advance(iter, i);
             regions.insert(iter, region);
         }
     }
     // Check for padding after the last region
-    if (regions.back().offset + regions.back().length < (UINT32)intelImage.size()) {
+    if ((UINT64)regions.back().offset + (UINT64)regions.back().length < (UINT64)intelImage.size()) {
         region.offset = regions.back().offset + regions.back().length;
-        region.length = intelImage.size() - region.offset;
+        region.length = (UINT32)(intelImage.size() - region.offset);
         region.data = intelImage.mid(region.offset, region.length);
         region.type = getPaddingType(region.data);
         regions.push_back(region);
     }
     
     // Region map is consistent
-
+    
     // Intel image
-    QString name = QObject::tr("Intel image");
-    QString info = QObject::tr("Full size: %1h (%2)\nFlash chips: %3\nRegions: %4\nMasters: %5\nPCH straps: %6\nPROC straps: %7")
-        .hexarg(intelImage.size()).arg(intelImage.size())
-        .arg(descriptorMap->NumberOfFlashChips + 1) //
-        .arg(descriptorMap->NumberOfRegions + 1)    // Zero-based numbers in storage
-        .arg(descriptorMap->NumberOfMasters + 1)    //
-        .arg(descriptorMap->NumberOfPchStraps)
-        .arg(descriptorMap->NumberOfProcStraps);
-
-    // Construct parsing data
-    pdata.offset = parentOffset;
-
+    UString name("Intel image");
+    UString info = usprintf("Flash chips: %u\nRegions: %u\nMasters: %u\nPCH straps: %u\nPROC straps: %u",
+                            descriptorMap->NumberOfFlashChips + 1, //
+                            descriptorMap->NumberOfRegions + 1,    // Zero-based numbers in storage
+                            descriptorMap->NumberOfMasters + 1,    //
+                            descriptorMap->NumberOfPchStraps,
+                            descriptorMap->NumberOfProcStraps);
+    
+    // Set image base
+    imageBase = model->base(parent) + localOffset;
+    
     // Add Intel image tree item
-    index = model->addItem(Types::Image, Subtypes::IntelImage, name, QString(), info, QByteArray(), intelImage, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
+    index = model->addItem(localOffset, Types::Image, Subtypes::IntelImage, name, UString(), info, UByteArray(), intelImage, UByteArray(), Fixed, parent);
+    
     // Descriptor
     // Get descriptor info
-    QByteArray body = intelImage.left(FLASH_DESCRIPTOR_SIZE);
-    name = QObject::tr("Descriptor region");
-    info = QObject::tr("Full size: %1h (%2)").hexarg(FLASH_DESCRIPTOR_SIZE).arg(FLASH_DESCRIPTOR_SIZE);
+    UByteArray body = intelImage.left(FLASH_DESCRIPTOR_SIZE);
+    name = UString("Descriptor region");
+    info = usprintf("ReservedVector:\n%02X %02X %02X %02X %02X %02X %02X %02X\n"
+                    "%02X %02X %02X %02X %02X %02X %02X %02X",
+                    descriptor->ReservedVector[0],  descriptor->ReservedVector[1],  descriptor->ReservedVector[2],  descriptor->ReservedVector[3],
+                    descriptor->ReservedVector[4],  descriptor->ReservedVector[5],  descriptor->ReservedVector[6],  descriptor->ReservedVector[7],
+                    descriptor->ReservedVector[8],  descriptor->ReservedVector[9],  descriptor->ReservedVector[10], descriptor->ReservedVector[11],
+                    descriptor->ReservedVector[12], descriptor->ReservedVector[13], descriptor->ReservedVector[14], descriptor->ReservedVector[15]);
     
     // Add offsets of actual regions
     for (size_t i = 0; i < regions.size(); i++) {
         if (regions[i].type != Subtypes::ZeroPadding && regions[i].type != Subtypes::OnePadding && regions[i].type != Subtypes::DataPadding)
-            info += QObject::tr("\n%1 region offset: %2h").arg(itemSubtypeToQString(Types::Region, regions[i].type)).hexarg(regions[i].offset + parentOffset);
+            info += "\n" + itemSubtypeToUString(Types::Region, regions[i].type)
+            + usprintf(" region offset: %Xh", regions[i].offset + localOffset);
     }
-
+    
     // Region access settings
     if (descriptorVersion == 1) {
-        const FLASH_DESCRIPTOR_MASTER_SECTION* masterSection = (const FLASH_DESCRIPTOR_MASTER_SECTION*)calculateAddress8(descriptor, descriptorMap->MasterBase);
-        info += QObject::tr("\nRegion access settings:");
-        info += QObject::tr("\nBIOS: %1h %2h ME: %3h %4h\nGbE:  %5h %6h")
-            .hexarg2(masterSection->BiosRead, 2)
-            .hexarg2(masterSection->BiosWrite, 2)
-            .hexarg2(masterSection->MeRead, 2)
-            .hexarg2(masterSection->MeWrite, 2)
-            .hexarg2(masterSection->GbeRead, 2)
-            .hexarg2(masterSection->GbeWrite, 2);
-
+        const FLASH_DESCRIPTOR_MASTER_SECTION* masterSection = (const FLASH_DESCRIPTOR_MASTER_SECTION*)calculateAddress8((UINT8*)descriptor, descriptorMap->MasterBase);
+        info += UString("\nRegion access settings:");
+        info += usprintf("\nBIOS: %02Xh %02Xh ME: %02Xh %02Xh\nGbE:  %02Xh %02Xh",
+                         masterSection->BiosRead,
+                         masterSection->BiosWrite,
+                         masterSection->MeRead,
+                         masterSection->MeWrite,
+                         masterSection->GbeRead,
+                         masterSection->GbeWrite);
+        
         // BIOS access table
-        info += QObject::tr("\nBIOS access table:");
-        info += QObject::tr("\n      Read  Write");
-        info += QObject::tr("\nDesc  %1  %2")
-            .arg(masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_DESC ? "Yes " : "No  ")
-            .arg(masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_DESC ? "Yes " : "No  ");
-        info += QObject::tr("\nBIOS  Yes   Yes");
-        info += QObject::tr("\nME    %1  %2")
-            .arg(masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_ME ? "Yes " : "No  ")
-            .arg(masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_ME ? "Yes " : "No  ");
-        info += QObject::tr("\nGbE   %1  %2")
-            .arg(masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_GBE ? "Yes " : "No  ")
-            .arg(masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_GBE ? "Yes " : "No  ");
-        info += QObject::tr("\nPDR   %1  %2")
-            .arg(masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_PDR ? "Yes " : "No  ")
-            .arg(masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_PDR ? "Yes " : "No  ");
+        info  += UString("\nBIOS access table:")
+        + UString("\n      Read  Write")
+        + usprintf("\nDesc  %s  %s",  masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_DESC ? "Yes " : "No  ",
+                   masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_DESC ? "Yes " : "No  ");
+        info  += UString("\nBIOS  Yes   Yes")
+        + usprintf("\nME    %s  %s",  masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_ME   ? "Yes " : "No  ",
+                   masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_ME   ? "Yes " : "No  ");
+        info += usprintf("\nGbE   %s  %s",  masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_GBE  ? "Yes " : "No  ",
+                         masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_GBE  ? "Yes " : "No  ");
+        info += usprintf("\nPDR   %s  %s",  masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_PDR  ? "Yes " : "No  ",
+                         masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_PDR  ? "Yes " : "No  ");
     }
     else if (descriptorVersion == 2) {
-        const FLASH_DESCRIPTOR_MASTER_SECTION_V2* masterSection = (const FLASH_DESCRIPTOR_MASTER_SECTION_V2*)calculateAddress8(descriptor, descriptorMap->MasterBase);
-        info += QObject::tr("\nRegion access settings:");
-        info += QObject::tr("\nBIOS: %1h %2h ME: %3h %4h\nGbE:  %5h %6h EC: %7h %8h")
-            .hexarg2(masterSection->BiosRead, 3)
-            .hexarg2(masterSection->BiosWrite, 3)
-            .hexarg2(masterSection->MeRead, 3)
-            .hexarg2(masterSection->MeWrite, 3)
-            .hexarg2(masterSection->GbeRead, 3)
-            .hexarg2(masterSection->GbeWrite, 3)
-            .hexarg2(masterSection->EcRead, 3)
-            .hexarg2(masterSection->EcWrite, 3);
-
+        const FLASH_DESCRIPTOR_MASTER_SECTION_V2* masterSection = (const FLASH_DESCRIPTOR_MASTER_SECTION_V2*)calculateAddress8((UINT8*)descriptor, descriptorMap->MasterBase);
+        info += UString("\nRegion access settings:");
+        info += usprintf("\nBIOS: %03Xh %03Xh"
+                         "\nME:   %03Xh %03Xh"
+                         "\nGbE:  %03Xh %03Xh"
+                         "\nEC:   %03Xh %03Xh",
+                         masterSection->BiosRead,
+                         masterSection->BiosWrite,
+                         masterSection->MeRead,
+                         masterSection->MeWrite,
+                         masterSection->GbeRead,
+                         masterSection->GbeWrite,
+                         masterSection->EcRead,
+                         masterSection->EcWrite);
+        
         // BIOS access table
-        info += QObject::tr("\nBIOS access table:");
-        info += QObject::tr("\n      Read  Write");
-        info += QObject::tr("\nDesc  %1  %2")
-            .arg(masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_DESC ? "Yes " : "No  ")
-            .arg(masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_DESC ? "Yes " : "No  ");
-        info += QObject::tr("\nBIOS  Yes   Yes");
-        info += QObject::tr("\nME    %1  %2")
-            .arg(masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_ME ? "Yes " : "No  ")
-            .arg(masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_ME ? "Yes " : "No  ");
-        info += QObject::tr("\nGbE   %1  %2")
-            .arg(masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_GBE ? "Yes " : "No  ")
-            .arg(masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_GBE ? "Yes " : "No  ");
-        info += QObject::tr("\nPDR   %1  %2")
-            .arg(masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_PDR ? "Yes " : "No  ")
-            .arg(masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_PDR ? "Yes " : "No  ");
-        info += QObject::tr("\nEC    %1  %2")
-            .arg(masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_EC ? "Yes " : "No  ")
-            .arg(masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_EC ? "Yes " : "No  ");
+        info  += UString("\nBIOS access table:")
+        + UString("\n      Read  Write")
+        + usprintf("\nDesc  %s  %s",
+                   masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_DESC ? "Yes " : "No  ",
+                   masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_DESC ? "Yes " : "No  ");
+        info  += UString("\nBIOS  Yes   Yes")
+        + usprintf("\nME    %s  %s",
+                   masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_ME ? "Yes " : "No  ",
+                   masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_ME ? "Yes " : "No  ");
+        info += usprintf("\nGbE   %s  %s",
+                         masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_GBE ? "Yes " : "No  ",
+                         masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_GBE ? "Yes " : "No  ");
+        info += usprintf("\nPDR   %s  %s",
+                         masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_PDR ? "Yes " : "No  ",
+                         masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_PDR ? "Yes " : "No  ");
+        info += usprintf("\nEC    %s  %s",
+                         masterSection->BiosRead  & FLASH_DESCRIPTOR_REGION_ACCESS_EC ? "Yes " : "No  ",
+                         masterSection->BiosWrite & FLASH_DESCRIPTOR_REGION_ACCESS_EC ? "Yes " : "No  ");
+        
+        // Prepend descriptor version if present
+        if (descriptorMap->DescriptorVersion != FLASH_DESCRIPTOR_VERSION_INVALID) {
+            const FLASH_DESCRIPTOR_VERSION* version = (const FLASH_DESCRIPTOR_VERSION*)&descriptorMap->DescriptorVersion;
+            UString versionStr = usprintf("Flash descriptor version: %d.%d", version->Major, version->Minor);
+            if (version->Major != FLASH_DESCRIPTOR_VERSION_MAJOR || version->Minor != FLASH_DESCRIPTOR_VERSION_MINOR) {
+                versionStr += ", unknown";
+                msg(usprintf("%s: unknown flash descriptor version %d.%d", __FUNCTION__, version->Major, version->Minor));
+            }
+            info = versionStr + "\n" + info;
+        }
     }
-
+    
     // VSCC table
-    const VSCC_TABLE_ENTRY* vsccTableEntry = (const VSCC_TABLE_ENTRY*)(descriptor + ((UINT16)upperMap->VsccTableBase << 4));
-    info += QObject::tr("\nFlash chips in VSCC table:");
+    const VSCC_TABLE_ENTRY* vsccTableEntry = (const VSCC_TABLE_ENTRY*)((UINT8*)descriptor + ((UINT16)upperMap->VsccTableBase << 4));
+    info += UString("\nFlash chips in VSCC table:");
     UINT8 vsscTableSize = upperMap->VsccTableSize * sizeof(UINT32) / sizeof(VSCC_TABLE_ENTRY);
-    for (int i = 0; i < vsscTableSize; i++) {
-        info += QObject::tr("\n%1%2%3h")
-            .hexarg2(vsccTableEntry->VendorId, 2)
-            .hexarg2(vsccTableEntry->DeviceId0, 2)
-            .hexarg2(vsccTableEntry->DeviceId1, 2);
+    for (UINT8 i = 0; i < vsscTableSize; i++) {
+        UString jedecId = jedecIdToUString(vsccTableEntry->VendorId, vsccTableEntry->DeviceId0, vsccTableEntry->DeviceId1);
+        info += usprintf("\n%02X%02X%02X (", vsccTableEntry->VendorId, vsccTableEntry->DeviceId0, vsccTableEntry->DeviceId1)
+        + jedecId
+        + UString(")");
+        if (jedecId.startsWith("Unknown")) {
+            msg(usprintf("%s: SPI flash with unknown JEDEC ID %02X%02X%02X found in VSCC table", __FUNCTION__,
+                         vsccTableEntry->VendorId, vsccTableEntry->DeviceId0, vsccTableEntry->DeviceId1), index);
+        }
         vsccTableEntry++;
     }
-
+    
     // Add descriptor tree item
-    QModelIndex regionIndex = model->addItem(Types::Region, Subtypes::DescriptorRegion, name, QString(), info, QByteArray(), body, QByteArray(), true, parsingDataToQByteArray(pdata), index);
+    UModelIndex regionIndex = model->addItem(localOffset, Types::Region, Subtypes::DescriptorRegion, name, UString(), info, UByteArray(), body, UByteArray(), Fixed, index);
     
     // Parse regions
-    UINT8 result = ERR_SUCCESS;
-    UINT8 parseResult = ERR_SUCCESS;
+    USTATUS result = U_SUCCESS;
+    USTATUS parseResult = U_SUCCESS;
     for (size_t i = 0; i < regions.size(); i++) {
         region = regions[i];
         switch (region.type) {
-        case Subtypes::BiosRegion:
-            result = parseBiosRegion(region.data, region.offset, index, regionIndex);
-            break;
-        case Subtypes::MeRegion:
-            result = parseMeRegion(region.data, region.offset, index, regionIndex);
-            break;
-        case Subtypes::GbeRegion:
-            result = parseGbeRegion(region.data, region.offset, index, regionIndex);
-            break;
-        case Subtypes::PdrRegion:
-            result = parsePdrRegion(region.data, region.offset, index, regionIndex);
-            break;
-        case Subtypes::Reserved1Region:
-        case Subtypes::Reserved2Region:
-        case Subtypes::Reserved3Region:
-        case Subtypes::EcRegion:
-        case Subtypes::Reserved4Region:
-            result = parseGeneralRegion(region.type, region.data, region.offset, index, regionIndex);
-            break;
-        case Subtypes::ZeroPadding:
-        case Subtypes::OnePadding:
-        case Subtypes::DataPadding: {
-            // Add padding between regions
-            QByteArray padding = intelImage.mid(region.offset, region.length);
-
-            // Get parent's parsing data
-            PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-
-            // Get info
-            name = QObject::tr("Padding");
-            info = QObject::tr("Full size: %1h (%2)")
-                .hexarg(padding.size()).arg(padding.size());
-
-            // Construct parsing data
-            pdata.offset = parentOffset + region.offset;
-
-            // Add tree item
-            regionIndex = model->addItem(Types::Padding, getPaddingType(padding), name, QString(), info, QByteArray(), padding, QByteArray(), true, parsingDataToQByteArray(pdata), index);
-            result = ERR_SUCCESS;
+            case Subtypes::BiosRegion:
+                result = parseBiosRegion(region.data, region.offset, index, regionIndex);
+                break;
+            case Subtypes::MeRegion:
+                result = parseMeRegion(region.data, region.offset, index, regionIndex);
+                break;
+            case Subtypes::GbeRegion:
+                result = parseGbeRegion(region.data, region.offset, index, regionIndex);
+                break;
+            case Subtypes::PdrRegion:
+                result = parsePdrRegion(region.data, region.offset, index, regionIndex);
+                break;
+            case Subtypes::DevExp1Region:
+                result = parseDevExp1Region(region.data, region.offset, index, regionIndex);
+                break;
+            case Subtypes::Bios2Region:
+            case Subtypes::MicrocodeRegion:
+            case Subtypes::EcRegion:
+            case Subtypes::DevExp2Region:
+            case Subtypes::IeRegion:
+            case Subtypes::Tgbe1Region:
+            case Subtypes::Tgbe2Region:
+            case Subtypes::Reserved1Region:
+            case Subtypes::Reserved2Region:
+            case Subtypes::PttRegion:
+                result = parseGenericRegion(region.type, region.data, region.offset, index, regionIndex);
+                break;
+            case Subtypes::ZeroPadding:
+            case Subtypes::OnePadding:
+            case Subtypes::DataPadding: {
+                // Add padding between regions
+                UByteArray padding = intelImage.mid(region.offset, region.length);
+                
+                // Get info
+                name = UString("Padding");
+                
+                // Add tree item
+                regionIndex = model->addItem(region.offset, Types::Padding, getPaddingType(padding), name, UString(), UString(), UByteArray(), padding, UByteArray(), Fixed, index);
+                result = U_SUCCESS;
             } break;
-        default:
-            msg(QObject::tr("parseIntelImage: region of unknown type found"), index);
-            result = ERR_INVALID_FLASH_DESCRIPTOR;
+            default:
+                msg(usprintf("%s: region of unknown type found", __FUNCTION__), index);
+                result = U_INVALID_FLASH_DESCRIPTOR;
         }
         // Store the first failed result as a final result
-        if (!parseResult && result)
+        if (!parseResult && result) {
             parseResult = result;
+        }
     }
-
+    
     return parseResult;
 }
 
-STATUS FfsParser::parseGbeRegion(const QByteArray & gbe, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+USTATUS FfsParser::parseGbeRegion(const UByteArray & gbe, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index)
 {
     // Check sanity
     if (gbe.isEmpty())
-        return ERR_EMPTY_REGION;
+        return U_EMPTY_REGION;
     if ((UINT32)gbe.size() < GBE_VERSION_OFFSET + sizeof(GBE_VERSION))
-        return ERR_INVALID_REGION;
-
-    // Get parent's parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
+        return U_INVALID_REGION;
+    
     // Get info
-    QString name = QObject::tr("GbE region");
+    UString name("GbE region");
     const GBE_MAC_ADDRESS* mac = (const GBE_MAC_ADDRESS*)gbe.constData();
     const GBE_VERSION* version = (const GBE_VERSION*)(gbe.constData() + GBE_VERSION_OFFSET);
-    QString info = QObject::tr("Full size: %1h (%2)\nMAC: %3:%4:%5:%6:%7:%8\nVersion: %9.%10")
-        .hexarg(gbe.size()).arg(gbe.size())
-        .hexarg2(mac->vendor[0], 2)
-        .hexarg2(mac->vendor[1], 2)
-        .hexarg2(mac->vendor[2], 2)
-        .hexarg2(mac->device[0], 2)
-        .hexarg2(mac->device[1], 2)
-        .hexarg2(mac->device[2], 2)
-        .arg(version->major)
-        .arg(version->minor);
-
-    // Construct parsing data
-    pdata.offset += parentOffset;
-
+    UString info = usprintf("MAC: %02X:%02X:%02X:%02X:%02X:%02X\nVersion: %u.%u",
+                            mac->vendor[0], mac->vendor[1], mac->vendor[2],
+                            mac->device[0], mac->device[1], mac->device[2],
+                            version->major,
+                            version->minor);
+    
     // Add tree item
-    index = model->addItem(Types::Region, Subtypes::GbeRegion, name, QString(), info, QByteArray(), gbe, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
-    return ERR_SUCCESS;
+    index = model->addItem(localOffset, Types::Region, Subtypes::GbeRegion, name, UString(), info, UByteArray(), gbe, UByteArray(), Fixed, parent);
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseMeRegion(const QByteArray & me, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+USTATUS FfsParser::parseMeRegion(const UByteArray & me, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index)
 {
     // Check sanity
     if (me.isEmpty())
-        return ERR_EMPTY_REGION;
-
-    // Get parent's parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
+        return U_EMPTY_REGION;
+    
     // Get info
-    QString name = QObject::tr("ME region");
-    QString info = QObject::tr("Full size: %1h (%2)").
-        hexarg(me.size()).arg(me.size());
-
+    UString name("ME region");
+    UString info;
+    
     // Parse region
-    bool versionFound = true;
     bool emptyRegion = false;
     // Check for empty region
-    if (me.count() == me.count('\xFF') || me.count() == me.count('\x00')) {
+    auto c = uniformByte(me);
+    if (c <= UINT8_MAX) {
         // Further parsing not needed
         emptyRegion = true;
-        info += QObject::tr("\nState: empty");
+        info = usprintf("State: empty (%02Xh)", (UINT8)c);
     }
-    else {
-        // Search for new signature
-        INT32 versionOffset = me.indexOf(ME_VERSION_SIGNATURE2);
-        if (versionOffset < 0){ // New signature not found
-            // Search for old signature
-            versionOffset = me.indexOf(ME_VERSION_SIGNATURE);
-            if (versionOffset < 0){
-                info += QObject::tr("\nVersion: unknown");
-                versionFound = false;
-            }
-        }
-
-        // Check sanity
-        if ((UINT32)me.size() < (UINT32)versionOffset + sizeof(ME_VERSION))
-            return ERR_INVALID_REGION;
-
-        // Add version information
-        if (versionFound) {
-            const ME_VERSION* version = (const ME_VERSION*)(me.constData() + versionOffset);
-            info += QObject::tr("\nVersion: %1.%2.%3.%4")
-                .arg(version->major)
-                .arg(version->minor)
-                .arg(version->bugfix)
-                .arg(version->build);
-        }
-    }
-
-    // Construct parsing data
-    pdata.offset += parentOffset;
-
+    
     // Add tree item
-    index = model->addItem(Types::Region, Subtypes::MeRegion, name, QString(), info, QByteArray(), me, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
+    index = model->addItem(localOffset, Types::Region, Subtypes::MeRegion, name, UString(), info, UByteArray(), me, UByteArray(), Fixed, parent);
+    
     // Show messages
     if (emptyRegion) {
-        msg(QObject::tr("parseMeRegion: ME region is empty"), index);
+        msg(usprintf("%s: ME region is empty", __FUNCTION__), index);
     }
-    else if (!versionFound) {
-        msg(QObject::tr("parseMeRegion: ME version is unknown, it can be damaged"), index);
+    else {
+        meParser->parseMeRegionBody(index);
     }
-
-    return ERR_SUCCESS;
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parsePdrRegion(const QByteArray & pdr, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+USTATUS FfsParser::parsePdrRegion(const UByteArray & pdr, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index)
 {
     // Check sanity
     if (pdr.isEmpty())
-        return ERR_EMPTY_REGION;
-
-    // Get parent's parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
+        return U_EMPTY_REGION;
+    
     // Get info
-    QString name = QObject::tr("PDR region");
-    QString info = QObject::tr("Full size: %1h (%2)").
-        hexarg(pdr.size()).arg(pdr.size());
-
-    // Construct parsing data
-    pdata.offset += parentOffset;
+    UString name("PDR region");
+    UString info;
+    
+    // Check for empty region
+    bool emptyRegion = false;
+    auto c = uniformByte(pdr);
+    if (c <= UINT8_MAX) {
+        // Further parsing not needed
+        emptyRegion = true;
+        info = usprintf("State: empty (%02Xh)", (UINT8)c);
+    }
 
     // Add tree item
-    index = model->addItem(Types::Region, Subtypes::PdrRegion, name, QString(), info, QByteArray(), pdr, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
-    // Parse PDR region as BIOS space
-    UINT8 result = parseRawArea(index);
-    if (result && result != ERR_VOLUMES_NOT_FOUND && result != ERR_INVALID_VOLUME)
-        return result;
-
-    return ERR_SUCCESS;
+    index = model->addItem(localOffset, Types::Region, Subtypes::PdrRegion, name, UString(), info, UByteArray(), pdr, UByteArray(), Fixed, parent);
+    
+    if (!emptyRegion) {
+        // Parse PDR region as raw area
+        USTATUS result = parseRawArea(index);
+        if (result && result != U_VOLUMES_NOT_FOUND && result != U_INVALID_VOLUME && result != U_STORES_NOT_FOUND)
+            return result;
+    }
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseGeneralRegion(const UINT8 subtype, const QByteArray & region, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+USTATUS FfsParser::parseDevExp1Region(const UByteArray & devExp1, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index)
+{
+    // Check sanity
+    if (devExp1.isEmpty())
+        return U_EMPTY_REGION;
+    
+    // Get info
+    UString name("DevExp1 region");
+    UString info;
+    
+    // Check for empty region
+    bool emptyRegion = false;
+    auto c = uniformByte(devExp1);
+    if (c <= UINT8_MAX) {
+        // Further parsing not needed
+        emptyRegion = true;
+        info = usprintf("State: empty (%02Xh)", (UINT8)c);
+    }
+    
+    // Add tree item
+    index = model->addItem(localOffset, Types::Region, Subtypes::DevExp1Region, name, UString(), info, UByteArray(), devExp1, UByteArray(), Fixed, parent);
+    
+    if (!emptyRegion) {
+        meParser->parseMeRegionBody(index);
+    }
+    return U_SUCCESS;
+}
+
+USTATUS FfsParser::parseGenericRegion(const UINT8 subtype, const UByteArray & region, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index)
 {
     // Check sanity
     if (region.isEmpty())
-        return ERR_EMPTY_REGION;
-
-    // Get parent's parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
+        return U_EMPTY_REGION;
+    
     // Get info
-    QString name = QObject::tr("%1 region").arg(itemSubtypeToQString(Types::Region, subtype));
-    QString info = QObject::tr("Full size: %1h (%2)").
-        hexarg(region.size()).arg(region.size());
-
-    // Construct parsing data
-    pdata.offset += parentOffset;
+    UString name = itemSubtypeToUString(Types::Region, subtype) + UString(" region");
+    UString info;
+    
+    // Check for empty region
+    bool emptyRegion = false;
+    auto c = uniformByte(region);
+    if (c <= UINT8_MAX) {
+        // Further parsing not needed
+        emptyRegion = true;
+        info = usprintf("State: empty (%02Xh)", (UINT8)c);
+    }
 
     // Add tree item
-    index = model->addItem(Types::Region, subtype, name, QString(), info, QByteArray(), region, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
-    return ERR_SUCCESS;
+    index = model->addItem(localOffset, Types::Region, subtype, name, UString(), info, UByteArray(), region, UByteArray(), Fixed, parent);
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseBiosRegion(const QByteArray & bios, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+USTATUS FfsParser::parseBiosRegion(const UByteArray & bios, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index)
 {
     // Sanity check
     if (bios.isEmpty())
-        return ERR_EMPTY_REGION;
-
-    // Get parent's parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
+        return U_EMPTY_REGION;
+    
     // Get info
-    QString name = QObject::tr("BIOS region");
-    QString info = QObject::tr("Full size: %1h (%2)").
-        hexarg(bios.size()).arg(bios.size());
-
-    // Construct parsing data
-    pdata.offset += parentOffset;
-
+    UString name("BIOS region");
+    
     // Add tree item
-    index = model->addItem(Types::Region, Subtypes::BiosRegion, name, QString(), info, QByteArray(), bios, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
+    index = model->addItem(localOffset, Types::Region, Subtypes::BiosRegion, name, UString(), UString(), UByteArray(), bios, UByteArray(), Fixed, parent);
+    
     return parseRawArea(index);
 }
 
-UINT8 FfsParser::getPaddingType(const QByteArray & padding)
-{
-    if (padding.count('\x00') == padding.count())
-        return Subtypes::ZeroPadding;
-    if (padding.count('\xFF') == padding.count())
-        return Subtypes::OnePadding;
-    return Subtypes::DataPadding;
-}
-
-STATUS FfsParser::parseRawArea(const QModelIndex & index)
+USTATUS FfsParser::parseRawArea(const UModelIndex & index)
 {
     // Sanity check
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
-    // Get parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-    UINT32 headerSize = model->header(index).size();
-    UINT32 offset = pdata.offset + headerSize;
-
+        return U_INVALID_PARAMETER;
+    
     // Get item data
-    QByteArray data = model->body(index);
-
-    // Search for first volume
-    STATUS result;
-    UINT32 prevVolumeOffset;
-
-    result = findNextVolume(index, data, offset, 0, prevVolumeOffset);
-    if (result)
-        return result;
-
-    // First volume is not at the beginning of RAW area
-    QString name;
-    QString info;
-    if (prevVolumeOffset > 0) {
-        // Get info
-        QByteArray padding = data.left(prevVolumeOffset);
-        name = QObject::tr("Padding");
-        info = QObject::tr("Full size: %1h (%2)")
-            .hexarg(padding.size()).arg(padding.size());
-
-        // Construct parsing data
-        pdata.offset = offset;
-
-        // Add tree item
-        model->addItem(Types::Padding, getPaddingType(padding), name, QString(), info, QByteArray(), padding, QByteArray(), true, parsingDataToQByteArray(pdata), index);
+    UByteArray data = model->body(index);
+    UINT32 headerSize = model->headerSize(index);
+    
+    // Obtain required information from parent volume, if it exists
+    UINT8 emptyByte = 0xFF;
+    UModelIndex parentVolumeIndex = model->findParentOfType(index, Types::Volume);
+    if (parentVolumeIndex.isValid() && model->hasEmptyParsingData(parentVolumeIndex) == false) {
+        UByteArray data = model->parsingData(parentVolumeIndex);
+        const VOLUME_PARSING_DATA* pdata = (const VOLUME_PARSING_DATA*)data.constData();
+        emptyByte = pdata->emptyByte;
     }
-
-    // Search for and parse all volumes
-    UINT32 volumeOffset = prevVolumeOffset;
-    UINT32 prevVolumeSize = 0;
-
-    while (!result)
-    {
-        // Padding between volumes
-        if (volumeOffset > prevVolumeOffset + prevVolumeSize) {
-            UINT32 paddingOffset = prevVolumeOffset + prevVolumeSize;
-            UINT32 paddingSize = volumeOffset - paddingOffset;
-            QByteArray padding = data.mid(paddingOffset, paddingSize);
-
-            // Get info
-            name = QObject::tr("Padding");
-            info = QObject::tr("Full size: %1h (%2)")
-                .hexarg(padding.size()).arg(padding.size());
-
-            // Construct parsing data
-            pdata.offset = offset + paddingOffset;
-
+    
+    // Search for the first item
+    UINT8  prevItemType = 0;
+    UINT32 prevItemOffset = 0;
+    UINT32 prevItemSize = 0;
+    UINT32 prevItemAltSize = 0;
+    
+    USTATUS result = findNextRawAreaItem(index, 0, prevItemType, prevItemOffset, prevItemSize, prevItemAltSize);
+    if (result) {
+        // No need to parse further
+        return U_STORES_NOT_FOUND;
+    }
+    
+    // Set base of protected regions to be the first volume
+    if (model->type(index) == Types::Region
+        && model->subtype(index) == Subtypes::BiosRegion) {
+        protectedRegionsBase = (UINT64)model->base(index) + prevItemOffset;
+    }
+    
+    // First item is not at the beginning of this raw area
+    if (prevItemOffset > 0) {
+        UByteArray padding = data.left(prevItemOffset);
+        // Add tree item
+        model->addItem(headerSize, Types::Padding, getPaddingType(padding), UString("Padding"), UString(), UString(), UByteArray(), padding, UByteArray(), Fixed, index);
+    }
+    
+    // Search for and parse all items
+    UINT8  itemType = prevItemType;
+    UINT32 itemOffset = prevItemOffset;
+    UINT32 itemSize = prevItemSize;
+    UINT32 itemAltSize = prevItemAltSize;
+    
+    while (!result) {
+        // Padding between items
+        if (itemOffset > prevItemOffset + prevItemSize) {
+            UINT32 paddingOffset = prevItemOffset + prevItemSize;
+            UINT32 paddingSize = itemOffset - paddingOffset;
+            UByteArray padding = data.mid(paddingOffset, paddingSize);
+            
             // Add tree item
-            model->addItem(Types::Padding, getPaddingType(padding), name, QString(), info, QByteArray(), padding, QByteArray(), true, parsingDataToQByteArray(pdata), index);
-        }
-
-        // Get volume size
-        UINT32 volumeSize = 0;
-        UINT32 bmVolumeSize = 0;
-        result = getVolumeSize(data, volumeOffset, volumeSize, bmVolumeSize);
-        if (result) {
-            msg(QObject::tr("parseRawArea: getVolumeSize failed with error \"%1\"").arg(errorCodeToQString(result)), index);
-            return result;
+            model->addItem(headerSize + paddingOffset, Types::Padding, getPaddingType(padding), UString("Padding"), UString(), UString(), UByteArray(), padding, UByteArray(), Fixed, index);
         }
         
-        // Check that volume is fully present in input
-        if (volumeSize > (UINT32)data.size() || volumeOffset + volumeSize > (UINT32)data.size()) {
-            msg(QObject::tr("parseRawArea: one of volumes inside overlaps the end of data"), index);
-            return ERR_INVALID_VOLUME;
-        }
-        
-        QByteArray volume = data.mid(volumeOffset, volumeSize);
-        if (volumeSize > (UINT32)volume.size()) {
-            // Mark the rest as padding and finish the parsing
-            QByteArray padding = data.right(volume.size());
-
-            // Get info
-            name = QObject::tr("Padding");
-            info = QObject::tr("Full size: %1h (%2)")
-                .hexarg(padding.size()).arg(padding.size());
-
-            // Construct parsing data
-            pdata.offset = offset + volumeOffset;
-
+        // Check that item is fully present in input
+        if (itemSize > (UINT32)data.size() || itemOffset + itemSize > (UINT32)data.size()) {
+            // Mark the rest as padding and finish parsing
+            UByteArray padding = data.mid(itemOffset);
+            
             // Add tree item
-            QModelIndex paddingIndex = model->addItem(Types::Padding, getPaddingType(padding), name, QString(), info, QByteArray(), padding, QByteArray(), true, parsingDataToQByteArray(pdata), index);
-            msg(QObject::tr("parseRawArea: one of volumes inside overlaps the end of data"), paddingIndex);
-
+            UModelIndex paddingIndex = model->addItem(headerSize + itemOffset, Types::Padding, getPaddingType(padding), UString("Padding"), UString(), UString(), UByteArray(), padding, UByteArray(), Fixed, index);
+            msg(usprintf("%s: one of objects inside overlaps the end of data", __FUNCTION__), paddingIndex);
+            
             // Update variables
-            prevVolumeOffset = volumeOffset;
-            prevVolumeSize = padding.size();
+            prevItemOffset = itemOffset;
+            prevItemSize = (UINT32)padding.size();
             break;
         }
-
-        // Parse current volume's header
-        QModelIndex volumeIndex;
-        result = parseVolumeHeader(volume, headerSize + volumeOffset, index, volumeIndex);
-        if (result)
-            msg(QObject::tr("parseRawArea: volume header parsing failed with error \"%1\"").arg(errorCodeToQString(result)), index);
-        else {
-            // Show messages
-            if (volumeSize != bmVolumeSize)
-                msg(QObject::tr("parseRawArea: volume size stored in header %1h (%2) differs from calculated using block map %3h (%4)")
-                .hexarg(volumeSize).arg(volumeSize)
-                .hexarg(bmVolumeSize).arg(bmVolumeSize),
-                volumeIndex);
+        
+        // Parse current volume header
+        if (itemType == Types::Volume) {
+            UModelIndex volumeIndex;
+            UByteArray volume = data.mid(itemOffset, itemSize);
+            result = parseVolumeHeader(volume, headerSize + itemOffset, index, volumeIndex);
+            if (result) {
+                msg(usprintf("%s: volume header parsing failed with error ", __FUNCTION__) + errorCodeToUString(result), index);
+            } else {
+                // Show messages
+                if (itemSize != itemAltSize)
+                    msg(usprintf("%s: volume size stored in header %Xh differs from calculated using block map %Xh", __FUNCTION__, itemSize, itemAltSize), volumeIndex);
+                
+                // Parse volume body
+                parseVolumeBody(volumeIndex);
+            }
         }
-
-        // Go to next volume
-        prevVolumeOffset = volumeOffset;
-        prevVolumeSize = volumeSize;
-        result = findNextVolume(index, data, offset, volumeOffset + prevVolumeSize, volumeOffset);
+        else if (itemType == Types::IntelMicrocode) {
+            UModelIndex microcodeIndex;
+            UByteArray microcode = data.mid(itemOffset, itemSize);
+            result = parseIntelMicrocodeHeader(microcode, headerSize + itemOffset, index, microcodeIndex);
+            if (result) {
+                msg(usprintf("%s: Intel microcode header parsing failed with error ", __FUNCTION__) + errorCodeToUString(result), index);
+            }
+        }
+        else if (itemType == Types::AmdMicrocode) {
+            UModelIndex microcodeIndex;
+            UByteArray microcode = data.mid(itemOffset, itemSize);
+            result = parseAmdMicrocodeHeader(microcode, headerSize + itemOffset, index, microcodeIndex);
+            if (result) {
+                msg(usprintf("%s: AMD microcode header parsing failed with error ", __FUNCTION__) + errorCodeToUString(result), index);
+            }
+        }
+        else if (itemType == Types::BpdtStore) {
+            UByteArray bpdtStore = data.mid(itemOffset, itemSize);
+            
+            // Add tree item
+            UModelIndex bpdtIndex = model->addItem(headerSize + itemOffset, Types::BpdtStore, 0, UString("BPDT region"), UString(), UString(), UByteArray(), bpdtStore, UByteArray(), Fixed, index);
+            
+            // Parse BPDT region
+            UModelIndex bpdtPtIndex;
+            UString meVersion;
+            result = parseBpdtRegion(bpdtStore, 0, 0, bpdtIndex, bpdtPtIndex, meVersion);
+            if (result) {
+                msg(usprintf("%s: BPDT store parsing failed with error ", __FUNCTION__) + errorCodeToUString(result), index);
+            }
+        }
+        else if (itemType == Types::InsydeFlashDeviceMapStore) {
+            try {
+                UByteArray fdm = data.mid(itemOffset, itemSize);
+                umemstream is(fdm.constData(), fdm.size());
+                kaitai::kstream ks(&is);
+                insyde_fdm_t parsed(&ks);
+                UINT32 storeSize = (UINT32)fdm.size();
+                
+                // Construct header and body
+                UByteArray header = fdm.left(parsed.data_offset());
+                UByteArray body = fdm.mid(header.size(), storeSize - header.size());
+                
+                // Add info
+                UString name = UString("Insyde H2O FlashDeviceMap");
+                UString info = usprintf("Entry size: %Xh (%u)\nEntry format: %02Xh\nRevision: %02Xh\nExtension count: %u\nFlash descriptor base address: %08Xh\nChecksum: %02Xh",
+                                        parsed.entry_size(), parsed.entry_size(),
+                                        parsed.entry_format(),
+                                        parsed.revision(),
+                                        parsed.num_extensions(),
+                                        (UINT32)parsed.fd_base_address(),
+                                        parsed.checksum());
+                // Check header checksum
+                {
+                    UByteArray tempHeader = data.mid(itemOffset, sizeof(INSYDE_FLASH_DEVICE_MAP_HEADER));
+                    INSYDE_FLASH_DEVICE_MAP_HEADER* tempFdmHeader = (INSYDE_FLASH_DEVICE_MAP_HEADER*)tempHeader.data();
+                    tempFdmHeader->Checksum = 0;
+                    UINT8 calculated = calculateChecksum8((const UINT8*)tempFdmHeader, (UINT32)tempHeader.size());
+                    if (calculated == parsed.checksum()) {
+                        info += UString(", valid");
+                    }
+                    else {
+                        info += usprintf(", invalid, should be %02Xh", calculated);
+                    }
+                }
+                
+                // Add header tree item
+                UModelIndex headerIndex = model->addItem(headerSize + itemOffset, Types::InsydeFlashDeviceMapStore, 0, name, UString(), info, header, body, UByteArray(), Fixed, index);
+                
+                // Check if we can add entries
+                if (parsed._is_null_entries()) {
+                    msg(usprintf("%s: FlashDeviceMap store with unknown entry format or size", __FUNCTION__), headerIndex);
+                }
+                else {
+                    // Add entries
+                    UINT32 entryOffset = parsed.data_offset();
+                    bool protectedRangeFound = false;
+                    for (const auto & entry : *parsed.entries()->entries()) {
+                        const EFI_GUID guid = readUnaligned((const EFI_GUID*)entry->guid().c_str());
+                        name = insydeFlashDeviceMapEntryTypeGuidToUString(guid);
+                        UString text;
+                        header = data.mid(itemOffset + entryOffset, sizeof(INSYDE_FLASH_DEVICE_MAP_ENTRY));
+                        body = data.mid(itemOffset + entryOffset + header.size(), parsed.entry_size() - header.size());
+                        
+                        // Add info
+                        UINT32 entrySize = (UINT32)header.size() + (UINT32)body.size();
+                        info = UString("Region type: ") + guidToUString(guid, false) + "\n";
+                        info += UString("Region id: ");
+                        for (UINT8 i = 0; i < 16; i++) {
+                            info += usprintf("%02X", *(const UINT8*)(entry->region_id().c_str() + i));
+                        }
+                        info += usprintf("\nRegion address: %08Xh\nRegion size: %08Xh\nAttributes: %08Xh (",
+                                         (UINT32)entry->region_base(),
+                                         (UINT32)entry->region_size(),
+                                         entry->attributes());
+                        
+                        // Add attributes
+                        // Ignored or Valid
+                        if ((entry->attributes() & INSYDE_FLASH_DEVICE_MAP_ENTRY_ATTRIBUTE_IGNORED) == 0) {
+                            info += UString("EntryValid");
+                        }
+                        else if ((entry->attributes() & INSYDE_FLASH_DEVICE_MAP_ENTRY_ATTRIBUTE_IGNORED) == INSYDE_FLASH_DEVICE_MAP_ENTRY_ATTRIBUTE_IGNORED) {
+                            info += UString("EntryIgnored");
+                        }
+                        // HashIgnored or HashVerified
+                        if ((entry->attributes() & INSYDE_FLASH_DEVICE_MAP_ENTRY_ATTRIBUTE_MODIFIABLE) == 0) {
+                            info += UString(", HashVerified");
+                        }
+                        else if ((entry->attributes() & INSYDE_FLASH_DEVICE_MAP_ENTRY_ATTRIBUTE_MODIFIABLE) == INSYDE_FLASH_DEVICE_MAP_ENTRY_ATTRIBUTE_MODIFIABLE) {
+                            info += UString(", HashIgnored");
+                        }
+                        // Unknown attributes other than the two known above
+                        if (entry->attributes() > INSYDE_FLASH_DEVICE_MAP_ENTRY_ATTRIBUTE_IGNORED + INSYDE_FLASH_DEVICE_MAP_ENTRY_ATTRIBUTE_MODIFIABLE) {
+                            UINT32 unknown_attributes = entry->attributes() & ~(UINT32)(INSYDE_FLASH_DEVICE_MAP_ENTRY_ATTRIBUTE_IGNORED | INSYDE_FLASH_DEVICE_MAP_ENTRY_ATTRIBUTE_MODIFIABLE);
+                            info += usprintf(", Unknown %08Xh", unknown_attributes);
+                            msg(usprintf("%s: FlashDeviceMap entry with unknown attributes %08Xh", __FUNCTION__, unknown_attributes), headerIndex);
+                        }
+                        info += UString(")");
+                        
+                        // Add hash
+                        info += UString("\nSHA256: ");
+                        for (UINT16 j = 0; j < (UINT16)body.size(); j++) {
+                            info += usprintf("%02X", (UINT8)body.constData()[j]);
+                        }
+                        
+                        if ((entry->attributes() & INSYDE_FLASH_DEVICE_MAP_ENTRY_ATTRIBUTE_MODIFIABLE) == 0) {
+                            if (!protectedRangeFound) {
+                                securityInfo += usprintf("Insyde Flash Device Map found at base %08Xh\nProtected ranges:\n", model->base(headerIndex));
+                                protectedRangeFound = true;
+                            }
+                            
+                            // Add this region to the list of Insyde protected regions
+                            PROTECTED_RANGE range = {};
+                            range.Offset = (UINT32)entry->region_base();
+                            range.Size = (UINT32)entry->region_size();
+                            range.AlgorithmId = TCG_HASH_ALGORITHM_ID_SHA256;
+                            range.Type = PROTECTED_RANGE_VENDOR_HASH_INSYDE;
+                            range.Hash = body;
+                            protectedRanges.push_back(range);
+                            
+                            securityInfo += usprintf("Address: %08Xh Size: %Xh\nHash: ", range.Offset, range.Size) + UString(body.toHex().constData()) + "\n";
+                        }
+                        
+                        // Add tree item
+                        model->addItem(entryOffset, Types::InsydeFlashDeviceMapEntry, 0, name, text, info, header, body, UByteArray(), Fixed, headerIndex);
+                        
+                        entryOffset += entrySize;
+                    }
+                    
+                    if (protectedRangeFound) {
+                        securityInfo += "\n";
+                    }
+                }
+            }
+            catch (...) {
+                // Parsing failed, need to add the candidate as Padding
+                UByteArray padding = data.mid(itemOffset, itemSize);
+                
+                // Add tree item
+                model->addItem(headerSize + itemOffset, Types::Padding, getPaddingType(padding), UString("Padding"), UString(), UString(), UByteArray(), padding, UByteArray(), Fixed, index);
+            }
+        }
+#ifdef U_ENABLE_NVRAM_PARSING_SUPPORT
+        else if (itemType == Types::DellDvarStore) {
+            try {
+                UByteArray dvar = data.mid(itemOffset, itemSize);
+                umemstream is(dvar.constData(), dvar.size());
+                kaitai::kstream ks(&is);
+                dell_dvar_t parsed(&ks);
+                UINT32 storeSize = (UINT32)dvar.size();
+                
+                // Construct header and body
+                UByteArray header = dvar.left(parsed.data_offset());
+                UByteArray body = dvar.mid(header.size(), storeSize - header.size());
+                
+                // Add info
+                UString name = UString("Dell DVAR Store");
+                UString info = usprintf("Flags: %02Xh", parsed.flags());
+                
+                // Add header tree item
+                UModelIndex headerIndex = model->addItem(headerSize + itemOffset, Types::DellDvarStore, 0, name, UString(), info, header, body, UByteArray(), Fixed, index);
+                
+                // Add entries
+                std::map<UINT16, EFI_GUID> guidMap;
+                UINT32 entryOffset = parsed.data_offset();
+                for (const auto & entry : *parsed.entries()) {
+                    // This is the terminating entry, needs special processing
+                    if (entry->_is_null_flags_c()) {
+                        // Add free space or padding after all entries, if needed
+                        if (entryOffset < storeSize) {
+                            UByteArray freeSpace = dvar.mid(entryOffset, storeSize - entryOffset);
+                            // Check that remaining unparsed bytes are actually empty
+                            if (isUniformByte(freeSpace, emptyByte)) { // Free space
+                                // Add tree item
+                                model->addItem(entryOffset, Types::FreeSpace, 0, UString("Free space"), UString(), UString(), UByteArray(), freeSpace, UByteArray(), Fixed, headerIndex);
+                            }
+                            else {
+                                // Add tree item
+                                model->addItem(entryOffset, Types::Padding, getPaddingType(freeSpace), UString("Padding"), UString(), UString(), UByteArray(), freeSpace, UByteArray(), Fixed, headerIndex);
+                            }
+                        }
+                        break;
+                    }
+                    
+                    // Check entry format to be known
+                    bool formatKnown = true;
+                    // Check state to be known
+                    if (entry->state() != DVAR_ENTRY_STATE_STORING &&
+                        entry->state() != DVAR_ENTRY_STATE_STORED &&
+                        entry->state() != DVAR_ENTRY_STATE_DELETING &&
+                        entry->state() != DVAR_ENTRY_STATE_DELETED){
+                        formatKnown = false;
+                        msg(usprintf("%s: DVAR entry with unknown state %02X", __FUNCTION__, entry->state()), headerIndex);
+                    }
+                    
+                    // Check flags to be known
+                    if (entry->flags() != DVAR_ENTRY_FLAG_NAME_ID &&
+                        entry->flags() != DVAR_ENTRY_FLAG_NAME_ID + DVAR_ENTRY_FLAG_NAMESPACE_GUID) {
+                        formatKnown = false;
+                        msg(usprintf("%s: DVAR entry with unknown flags %02X", __FUNCTION__, entry->flags()), headerIndex);
+                    }
+                    
+                    // Check type to be known
+                    if (entry->type() != DVAR_ENTRY_TYPE_NAME_ID_8_DATA_SIZE_8 &&
+                        entry->type() != DVAR_ENTRY_TYPE_NAME_ID_16_DATA_SIZE_8 &&
+                        entry->type() != DVAR_ENTRY_TYPE_NAME_ID_16_DATA_SIZE_16) {
+                        formatKnown = false;
+                        msg(usprintf("%s: DVAR entry with unknown type %02X", __FUNCTION__, entry->type()), headerIndex);
+                    }
+                    
+                    // This is an unknown entry
+                    if (!formatKnown) {
+                        // No way to continue from here, because we can not be sure that the rest of the store got parsed correctly
+                        UByteArray padding = data.mid(entryOffset, storeSize - entryOffset);
+                        
+                        // Get info
+                        name = UString("Padding");
+                        
+                        // Add tree item
+                        model->addItem(entryOffset, Types::Padding, getPaddingType(padding), name, UString(), UString(), UByteArray(), padding, UByteArray(), Fixed, headerIndex);
+                    }
+                    // This is a normal entry
+                    else {
+                        UINT32 headerSize;
+                        UINT32 bodySize;
+                        UINT32 entrySize;
+                        UINT32 nameId;
+                        UINT8 subtype;
+                        UString text;
+                        
+                        // NamespaceGUID entry
+                        if (entry->flags() == DVAR_ENTRY_FLAG_NAME_ID + DVAR_ENTRY_FLAG_NAMESPACE_GUID) {
+                            // State of this variable only applies to the NameId part, not the NamespaceGuid part
+                            // This kind of variables with deleted state till need to be shown as valid
+                            subtype = Subtypes::NamespaceGuidDvarEntry;
+                            EFI_GUID guid = *(const EFI_GUID*)(entry->namespace_guid().c_str());
+                            headerSize = sizeof(DVAR_ENTRY_HEADER) + sizeof(EFI_GUID);
+                            if (entry->type() == DVAR_ENTRY_TYPE_NAME_ID_8_DATA_SIZE_8) {
+                                nameId = entry->name_id_8();
+                                bodySize = entry->len_data_8();
+                                headerSize += sizeof(UINT8) + sizeof(UINT8);
+                            }
+                            else if (entry->type() == DVAR_ENTRY_TYPE_NAME_ID_16_DATA_SIZE_8) {
+                                nameId = entry->name_id_16();
+                                bodySize = entry->len_data_8();
+                                headerSize += sizeof(UINT16) + sizeof(UINT8);
+                            }
+                            else if (entry->type() == DVAR_ENTRY_TYPE_NAME_ID_16_DATA_SIZE_16) {
+                                nameId = entry->name_id_16();
+                                bodySize = entry->len_data_16();
+                                headerSize += sizeof(UINT16) + sizeof(UINT16);
+                            }
+                            
+                            entrySize = headerSize + bodySize;
+                            header = dvar.mid(entryOffset, headerSize);
+                            body = dvar.mid(entryOffset + headerSize, bodySize);
+                            
+                            name = guidToUString(guid);
+                            text = usprintf("%X", nameId);
+                            info = usprintf("State: %02Xh\nFlags: %02Xh\nType: %02Xh\nNamespaceId: %Xh\nNameId: %Xh\n",
+                                            entry->state(),
+                                            entry->flags(),
+                                            entry->type(),
+                                            entry->namespace_id(),
+                                            nameId)
+                            + UString("NamespaceGuid: ") + guidToUString(guid, false);
+                            
+                            guidMap.insert(std::pair<UINT8, EFI_GUID>(entry->namespace_id(), guid));
+                        }
+                        // NameId entry
+                        else {
+                            subtype = Subtypes::NameIdDvarEntry;
+                            headerSize = sizeof(DVAR_ENTRY_HEADER);
+                            if (entry->type() == DVAR_ENTRY_TYPE_NAME_ID_8_DATA_SIZE_8) {
+                                nameId = entry->name_id_8();
+                                bodySize = entry->len_data_8();
+                                headerSize += sizeof(UINT8) + sizeof(UINT8);
+                            }
+                            else if (entry->type() == DVAR_ENTRY_TYPE_NAME_ID_16_DATA_SIZE_8) {
+                                nameId = entry->name_id_16();
+                                bodySize = entry->len_data_8();
+                                headerSize += sizeof(UINT16) + sizeof(UINT8);
+                            }
+                            else if (entry->type() == DVAR_ENTRY_TYPE_NAME_ID_16_DATA_SIZE_16) {
+                                nameId = entry->name_id_16();
+                                bodySize = entry->len_data_16();
+                                headerSize += sizeof(UINT16) + sizeof(UINT16);
+                            }
+                            
+                            entrySize = headerSize + bodySize;
+                            header = dvar.mid(entryOffset, headerSize);
+                            body = dvar.mid(entryOffset + headerSize, bodySize);
+                            
+                            name.clear();
+                            text = usprintf("%X", nameId);
+                            info = usprintf("State: %02Xh\nFlags: %02Xh\nType: %02Xh\nNamespaceId: %Xh\nNameId: %Xh\n",
+                                            entry->state(),
+                                            entry->flags(),
+                                            entry->type(),
+                                            entry->namespace_id(),
+                                            nameId);
+                        }
+                        
+                        // Mark NameId entries that are not stored as Invalid
+                        if (entry->flags() != DVAR_ENTRY_FLAG_NAME_ID + DVAR_ENTRY_FLAG_NAMESPACE_GUID &&
+                            (entry->state() == DVAR_ENTRY_STATE_STORING ||
+                             entry->state() == DVAR_ENTRY_STATE_DELETING ||
+                             entry->state() == DVAR_ENTRY_STATE_DELETED)) {
+                            subtype = Subtypes::InvalidDvarEntry;
+                            name = UString("Invalid");
+                            text.clear();
+                        }
+                        
+                        // Add tree item
+                        model->addItem(entryOffset, Types::DellDvarEntry, subtype, name, text, info, header, body, UByteArray(), Fixed, headerIndex);
+                        
+                        entryOffset += entrySize;
+                    }
+                }
+                
+                // Reparse all NameId variables to detect invalid ones and assign name and text to valid ones
+                for (int i = 0; i < model->rowCount(headerIndex); i++) {
+                    UModelIndex current = headerIndex.model()->index(i, 0, headerIndex);
+                    
+                    if (model->subtype(current) == Subtypes::NameIdDvarEntry) {
+                        UByteArray header = model->header(current);
+                        const DVAR_ENTRY_HEADER* nameIdHeader = (const DVAR_ENTRY_HEADER*)header.constData();
+                        UINT8 id = 0xFF - nameIdHeader->NamespaceIdC;
+                        UString guid;
+                        if (guidMap.count(id))
+                            guid = guidToUString(guidMap[id]);
+                        
+                        // Check for variable validity
+                        if (guid.isEmpty()) { // Guid not found
+                            model->setName(current, UString("Invalid"));
+                            model->setText(current, UString());
+                            msg(usprintf("%s: NameId variable with invalid NamespaceGuid", __FUNCTION__), current);
+                        }
+                        else { // Variable is OK, rename it
+                            model->setName(current, guid);
+                            model->addInfo(current, UString("NamespaceGuid: ") + guidToUString(guidMap[id], false));
+                        }
+                    }
+                }
+            }
+            catch (...) {
+                // Parsing failed, need to add the candidate as Padding
+                UByteArray padding = data.mid(itemOffset, itemSize);
+                
+                // Add tree item
+                model->addItem(headerSize + itemOffset, Types::Padding, getPaddingType(padding), UString("Padding"), UString(), UString(), UByteArray(), padding, UByteArray(), Fixed, index);
+            }
+        }
+#endif
+        else {
+            return U_UNKNOWN_ITEM_TYPE;
+        }
+        
+        // Go to next item
+        prevItemOffset = itemOffset;
+        prevItemSize = itemSize;
+        prevItemType = itemType;
+        result = findNextRawAreaItem(index, itemOffset + prevItemSize, itemType, itemOffset, itemSize, itemAltSize);
+        
+        // Silence value not used after assignment warning
+        (void)prevItemType;
     }
-
-    // Padding at the end of RAW area
-    volumeOffset = prevVolumeOffset + prevVolumeSize;
-    if ((UINT32)data.size() > volumeOffset) {
-        QByteArray padding = data.mid(volumeOffset);
-
-        // Get info
-        name = QObject::tr("Padding");
-        info = QObject::tr("Full size: %1h (%2)")
-            .hexarg(padding.size()).arg(padding.size());
-
-        // Construct parsing data
-        pdata.offset = offset + headerSize + volumeOffset;
+    
+    // Padding at the end of raw area
+    itemOffset = prevItemOffset + prevItemSize;
+    if ((UINT32)data.size() > itemOffset) {
+        UByteArray padding = data.mid(itemOffset);
 
         // Add tree item
-        model->addItem(Types::Padding, getPaddingType(padding), name, QString(), info, QByteArray(), padding, QByteArray(), true, parsingDataToQByteArray(pdata), index);
+        model->addItem(headerSize + itemOffset, Types::Padding, getPaddingType(padding), UString("Padding"), UString(), UString(), UByteArray(), padding, UByteArray(), Fixed, index);
     }
-
-    // Parse bodies
-    for (int i = 0; i < model->rowCount(index); i++) {
-        QModelIndex current = index.child(i, 0);
-        switch (model->type(current)) {
-        case Types::Volume:
-            parseVolumeBody(current);
-            break;
-        case Types::Padding:
-            // No parsing required
-            break;
-        default:
-            return ERR_UNKNOWN_ITEM_TYPE;
-        }
-    }
-
-    return ERR_SUCCESS;
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseVolumeHeader(const QByteArray & volume, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+USTATUS FfsParser::parseVolumeHeader(const UByteArray & volume, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index)
 {
     // Sanity check
     if (volume.isEmpty())
-        return ERR_INVALID_PARAMETER;
-
-    // Get parent's parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
+        return U_INVALID_PARAMETER;
+    
     // Check that there is space for the volume header
-        if ((UINT32)volume.size() < sizeof(EFI_FIRMWARE_VOLUME_HEADER)) {
-        msg(QObject::tr("parseVolumeHeader: input volume size %1h (%2) is smaller than volume header size 40h (64)").hexarg(volume.size()).arg(volume.size()));
-        return ERR_INVALID_VOLUME;
+    if ((UINT32)volume.size() < sizeof(EFI_FIRMWARE_VOLUME_HEADER)) {
+        msg(usprintf("%s: input volume size %Xh (%u) is smaller than volume header size 40h (64)", __FUNCTION__, (UINT32)volume.size(), (UINT32)volume.size()));
+        return U_INVALID_VOLUME;
     }
-
+    
     // Populate volume header
     const EFI_FIRMWARE_VOLUME_HEADER* volumeHeader = (const EFI_FIRMWARE_VOLUME_HEADER*)(volume.constData());
-
+    
     // Check sanity of HeaderLength value
     if ((UINT32)ALIGN8(volumeHeader->HeaderLength) > (UINT32)volume.size()) {
-        msg(QObject::tr("parseVolumeHeader: volume header overlaps the end of data"));
-        return ERR_INVALID_VOLUME;
+        msg(usprintf("%s: volume header overlaps the end of data", __FUNCTION__));
+        return U_INVALID_VOLUME;
     }
     // Check sanity of ExtHeaderOffset value
     if (volumeHeader->Revision > 1 && volumeHeader->ExtHeaderOffset
         && (UINT32)ALIGN8(volumeHeader->ExtHeaderOffset + sizeof(EFI_FIRMWARE_VOLUME_EXT_HEADER)) > (UINT32)volume.size()) {
-        msg(QObject::tr("parseVolumeHeader: extended volume header overlaps the end of data"));
-        return ERR_INVALID_VOLUME;
+        msg(usprintf("%s: extended volume header overlaps the end of data", __FUNCTION__));
+        return U_INVALID_VOLUME;
     }
-
+    
     // Calculate volume header size
     UINT32 headerSize;
-    EFI_GUID extendedHeaderGuid = {{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }};
+    EFI_GUID extendedHeaderGuid = {0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0 }};
     bool hasExtendedHeader = false;
     if (volumeHeader->Revision > 1 && volumeHeader->ExtHeaderOffset) {
         hasExtendedHeader = true;
@@ -998,157 +1361,166 @@ STATUS FfsParser::parseVolumeHeader(const QByteArray & volume, const UINT32 pare
         headerSize = volumeHeader->ExtHeaderOffset + extendedHeader->ExtHeaderSize;
         extendedHeaderGuid = extendedHeader->FvName;
     }
-    else
+    else {
         headerSize = volumeHeader->HeaderLength;
-
+    }
+    
     // Extended header end can be unaligned
     headerSize = ALIGN8(headerSize);
-
+    
     // Check for volume structure to be known
     bool isUnknown = true;
     bool isNvramVolume = false;
+    bool isAppleMicrocodeVolume = false;
     UINT8 ffsVersion = 0;
-
+    
     // Check for FFS v2 volume
-    QByteArray guid = QByteArray((const char*)volumeHeader->FileSystemGuid.Data, sizeof(EFI_GUID));
+    UByteArray guid = UByteArray((const char*)&volumeHeader->FileSystemGuid, sizeof(EFI_GUID));
     if (std::find(FFSv2Volumes.begin(), FFSv2Volumes.end(), guid) != FFSv2Volumes.end()) {
         isUnknown = false;
         ffsVersion = 2;
     }
-
     // Check for FFS v3 volume
-    if (std::find(FFSv3Volumes.begin(), FFSv3Volumes.end(), guid) != FFSv3Volumes.end()) {
+    else if (std::find(FFSv3Volumes.begin(), FFSv3Volumes.end(), guid) != FFSv3Volumes.end()) {
         isUnknown = false;
         ffsVersion = 3;
     }
-
     // Check for VSS NVRAM volume
-    if (guid == NVRAM_MAIN_STORE_VOLUME_GUID || guid == NVRAM_ADDITIONAL_STORE_VOLUME_GUID) {
+    else if (guid == NVRAM_MAIN_STORE_VOLUME_GUID || guid == NVRAM_ADDITIONAL_STORE_VOLUME_GUID) {
         isUnknown = false;
         isNvramVolume = true;
     }
-
+    // Check for Apple Microcode volume
+    else if (guid == EFI_APPLE_MICROCODE_VOLUME_GUID) {
+        isUnknown = false;
+        isAppleMicrocodeVolume = true;
+        headerSize = EFI_APPLE_MICROCODE_VOLUME_HEADER_SIZE;
+    }
+    
     // Check volume revision and alignment
     bool msgAlignmentBitsSet = false;
     bool msgUnaligned = false;
     bool msgUnknownRevision = false;
-    UINT32 alignment = 65536; // Default volume alignment is 64K
+    UINT32 alignment = 0x10000; // Default volume alignment is 64K
     if (volumeHeader->Revision == 1) {
         // Acquire alignment capability bit
-        bool alignmentCap = volumeHeader->Attributes & EFI_FVB_ALIGNMENT_CAP;
+        bool alignmentCap = (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_CAP) != 0;
         if (!alignmentCap) {
-            if ((volumeHeader->Attributes & 0xFFFF0000))
+            if (volumeHeader->Attributes & 0xFFFF0000)
                 msgAlignmentBitsSet = true;
         }
         // Do not check for volume alignment on revision 1 volumes
-        // No one gives a single crap about setting it correctly
-        /*else {
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_2) alignment = 2;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_4) alignment = 4;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_8) alignment = 8;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_16) alignment = 16;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_32) alignment = 32;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_64) alignment = 64;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_128) alignment = 128;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_256) alignment = 256;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_512) alignment = 512;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_1K) alignment = 1024;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_2K) alignment = 2048;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_4K) alignment = 4096;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_8K) alignment = 8192;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_16K) alignment = 16384;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_32K) alignment = 32768;
-            if (volumeHeader->Attributes & EFI_FVB_ALIGNMENT_64K) alignment = 65536;
-        }*/
+        // No one gives a single damn about setting it correctly
     }
     else if (volumeHeader->Revision == 2) {
         // Acquire alignment
-        alignment = (UINT32)pow(2.0, (int)(volumeHeader->Attributes & EFI_FVB2_ALIGNMENT) >> 16);
+        alignment = (UINT32)(1UL << ((volumeHeader->Attributes & EFI_FVB2_ALIGNMENT) >> 16));
         // Check alignment
-        if (!isUnknown && !model->compressed(parent) && ((pdata.offset + parentOffset - capsuleOffsetFixup) % alignment))
+        if (!isUnknown
+            && !model->compressed(parent) // Alignment checks don't really make sense for compressed volumes because they have to be extracted into memory, and by that point it's unlikely that the module doing such extraction will misalign them
+            && ((model->base(parent) + localOffset - imageBase) % alignment) != 0) // Explicit "is not zero" here for better code readability
             msgUnaligned = true;
     }
-    else
+    else {
         msgUnknownRevision = true;
-
+    }
+    
     // Check attributes
     // Determine value of empty byte
-    UINT8 emptyByte = volumeHeader->Attributes & EFI_FVB_ERASE_POLARITY ? '\xFF' : '\x00';
-
-    // Check for AppleCRC32 and AppleFreeSpaceOffset in ZeroVector
+    UINT8 emptyByte = volumeHeader->Attributes & EFI_FVB_ERASE_POLARITY ? 0xFF : 0x00;
+    
+    // Check for AppleCRC32 and UsedSpace in ZeroVector
     bool hasAppleCrc32 = false;
-    bool hasAppleFSO = false;
-    UINT32 volumeSize = volume.size();
-    UINT32 appleCrc32 = *(UINT32*)(volume.constData() + 8);
-    UINT32 appleFSO = *(UINT32*)(volume.constData() + 12);
+    UINT32 volumeSize = (UINT32)volume.size();
+    UINT32 appleCrc32 = readUnaligned((UINT32*)(volume.constData() + 8));
+    UINT32 usedSpace =  readUnaligned((UINT32*)(volume.constData() + 12));
     if (appleCrc32 != 0) {
         // Calculate CRC32 of the volume body
-        UINT32 crc = crc32(0, (const UINT8*)(volume.constData() + volumeHeader->HeaderLength), volumeSize - volumeHeader->HeaderLength);
+        UINT32 crc = (UINT32)crc32(0, (const UINT8*)(volume.constData() + volumeHeader->HeaderLength), volumeSize - volumeHeader->HeaderLength);
         if (crc == appleCrc32) {
             hasAppleCrc32 = true;
         }
-
-        // Check if FreeSpaceOffset is non-zero
-        if (appleFSO != 0) {
-            hasAppleFSO = true;
-        }
     }
-
+    
     // Check header checksum by recalculating it
     bool msgInvalidChecksum = false;
-    QByteArray tempHeader((const char*)volumeHeader, volumeHeader->HeaderLength);
+
+    if (volumeHeader->HeaderLength < sizeof(EFI_FIRMWARE_VOLUME_HEADER)) {
+        msg(usprintf("%s: input volume header length %04Xh (%hu) is smaller than volume header size", __FUNCTION__, volumeHeader->HeaderLength, volumeHeader->HeaderLength));
+        return U_INVALID_VOLUME;
+    }
+    UByteArray tempHeader((const char*)volumeHeader, volumeHeader->HeaderLength);
     ((EFI_FIRMWARE_VOLUME_HEADER*)tempHeader.data())->Checksum = 0;
     UINT16 calculated = calculateChecksum16((const UINT16*)tempHeader.constData(), volumeHeader->HeaderLength);
     if (volumeHeader->Checksum != calculated)
         msgInvalidChecksum = true;
-
+    
     // Get info
-    QByteArray header = volume.left(headerSize);
-    QByteArray body = volume.mid(headerSize);
-    QString name = guidToQString(volumeHeader->FileSystemGuid);
-    QString info = QObject::tr("Signature: _FVH\nZeroVector:\n%1 %2 %3 %4 %5 %6 %7 %8\n%9 %10 %11 %12 %13 %14 %15 %16\nFileSystem GUID: %17\nFull size: %18h (%19)\n"
-        "Header size: %20h (%21)\nBody size: %22h (%23)\nRevision: %24\nAttributes: %25h\nErase polarity: %26\nChecksum: %27h, %28")
-        .hexarg2(volumeHeader->ZeroVector[0], 2).hexarg2(volumeHeader->ZeroVector[1], 2).hexarg2(volumeHeader->ZeroVector[2], 2).hexarg2(volumeHeader->ZeroVector[3], 2)
-        .hexarg2(volumeHeader->ZeroVector[4], 2).hexarg2(volumeHeader->ZeroVector[5], 2).hexarg2(volumeHeader->ZeroVector[6], 2).hexarg2(volumeHeader->ZeroVector[7], 2)
-        .hexarg2(volumeHeader->ZeroVector[8], 2).hexarg2(volumeHeader->ZeroVector[9], 2).hexarg2(volumeHeader->ZeroVector[10], 2).hexarg2(volumeHeader->ZeroVector[11], 2)
-        .hexarg2(volumeHeader->ZeroVector[12], 2).hexarg2(volumeHeader->ZeroVector[13], 2).hexarg2(volumeHeader->ZeroVector[14], 2).hexarg2(volumeHeader->ZeroVector[15], 2)
-        .arg(guidToQString(volumeHeader->FileSystemGuid))
-        .hexarg(volumeSize).arg(volumeSize)
-        .hexarg(headerSize).arg(headerSize)
-        .hexarg(volumeSize - headerSize).arg(volumeSize - headerSize)
-        .arg(volumeHeader->Revision)
-        .hexarg2(volumeHeader->Attributes, 8)
-        .arg(emptyByte ? "1" : "0")
-        .hexarg2(volumeHeader->Checksum, 4)
-        .arg(msgInvalidChecksum ? QObject::tr("invalid, should be %1h").hexarg2(calculated, 4) : QObject::tr("valid"));
-
-    // Extended header present
-    if (volumeHeader->Revision > 1 && volumeHeader->ExtHeaderOffset) {
-        const EFI_FIRMWARE_VOLUME_EXT_HEADER* extendedHeader = (const EFI_FIRMWARE_VOLUME_EXT_HEADER*)(volume.constData() + volumeHeader->ExtHeaderOffset);
-        info += QObject::tr("\nExtended header size: %1h (%2)\nVolume GUID: %3")
-            .hexarg(extendedHeader->ExtHeaderSize).arg(extendedHeader->ExtHeaderSize)
-            .arg(guidToQString(extendedHeader->FvName));
+    if (headerSize >= (UINT32)volume.size()) {
+        return U_INVALID_VOLUME;
     }
-
-    // Construct parsing data
-    pdata.offset += parentOffset;
-    pdata.emptyByte = emptyByte;
-    pdata.ffsVersion = ffsVersion;
-    pdata.volume.hasExtendedHeader = hasExtendedHeader ? TRUE : FALSE;
-    pdata.volume.extendedHeaderGuid = extendedHeaderGuid;
-    pdata.volume.alignment = alignment;
-    pdata.volume.revision = volumeHeader->Revision;
-    pdata.volume.hasAppleCrc32 = hasAppleCrc32;
-    pdata.volume.hasAppleFSO = hasAppleFSO;
-    pdata.volume.isWeakAligned = (volumeHeader->Revision > 1 && (volumeHeader->Attributes & EFI_FVB2_WEAK_ALIGNMENT));
-
+    UByteArray header = volume.left(headerSize);
+    UByteArray body = volume.mid(headerSize);
+    UString name = guidToUString(volumeHeader->FileSystemGuid);
+    UString info = usprintf("ZeroVector:\n%02X %02X %02X %02X %02X %02X %02X %02X\n"
+                            "%02X %02X %02X %02X %02X %02X %02X %02X\nFileSystem GUID: ",
+                            volumeHeader->ZeroVector[0], volumeHeader->ZeroVector[1], volumeHeader->ZeroVector[2], volumeHeader->ZeroVector[3],
+                            volumeHeader->ZeroVector[4], volumeHeader->ZeroVector[5], volumeHeader->ZeroVector[6], volumeHeader->ZeroVector[7],
+                            volumeHeader->ZeroVector[8], volumeHeader->ZeroVector[9], volumeHeader->ZeroVector[10], volumeHeader->ZeroVector[11],
+                            volumeHeader->ZeroVector[12], volumeHeader->ZeroVector[13], volumeHeader->ZeroVector[14], volumeHeader->ZeroVector[15])
+    + guidToUString(volumeHeader->FileSystemGuid, false) \
+    + usprintf("\nRevision: %u\nAttributes: %08Xh\nErase polarity: %u\nChecksum: %04Xh",
+               volumeHeader->Revision,
+               volumeHeader->Attributes,
+               (emptyByte ? 1 : 0),
+               volumeHeader->Checksum) +
+    (msgInvalidChecksum ? usprintf(", invalid, should be %04Xh", calculated) : UString(", valid"));
+    
+    // Block size and blocks number
+    const EFI_FV_BLOCK_MAP_ENTRY* entry = (const EFI_FV_BLOCK_MAP_ENTRY*)(volume.constData() + sizeof(EFI_FIRMWARE_VOLUME_HEADER));
+    UString infoNumBlocks = usprintf("NumBlocks: %Xh (%u)", entry->NumBlocks, entry->NumBlocks);
+    UString infoLength = usprintf("Length: %Xh (%u)", entry->Length, entry->Length);
+    if (entry->NumBlocks == 0) {
+        infoNumBlocks += UString(", invalid, can not be zero");
+    }
+    if (entry->Length == 0)  {
+        infoLength += UString(", invalid, can not be zero");
+    }
+    if (entry->NumBlocks != 0 && entry->Length != 0) {
+        UINT32 volumeAltSize = entry->NumBlocks * entry->Length;
+        if (volumeSize != volumeAltSize) {
+            if (volumeAltSize % entry->Length == 0 && volumeSize % entry->Length == 0) {
+                infoNumBlocks += usprintf(", invalid, should be %Xh", volumeSize / entry->Length);
+                infoLength += ", valid";
+            }
+            else if (volumeAltSize % entry->NumBlocks == 0 && volumeSize % entry->NumBlocks == 0) {
+                infoNumBlocks += ", valid";
+                infoLength += usprintf(", invalid, should be %Xh", volumeSize / entry->NumBlocks);
+            }
+        }
+        else {
+            infoNumBlocks += ", valid";
+            infoLength += ", valid";
+        }
+    }
+    info += "\n" + infoNumBlocks + "\n" + infoLength;
+    
+    // Extended header
+    if (volumeHeader->Revision > 1 && volumeHeader->ExtHeaderOffset) {
+        if ((UINT32)volume.size() < volumeHeader->ExtHeaderOffset + sizeof(EFI_FIRMWARE_VOLUME_EXT_HEADER)) {
+            return U_INVALID_VOLUME;
+        }
+        const EFI_FIRMWARE_VOLUME_EXT_HEADER* extendedHeader = (const EFI_FIRMWARE_VOLUME_EXT_HEADER*)(volume.constData() + volumeHeader->ExtHeaderOffset);
+        info += usprintf("\nExtended header size: %Xh (%u)\nVolume GUID: ",
+                         extendedHeader->ExtHeaderSize, extendedHeader->ExtHeaderSize) + guidToUString(extendedHeader->FvName, false);
+        name = guidToUString(extendedHeader->FvName); // Replace FFS GUID with volume GUID
+    }
+    
     // Add text
-    QString text;
+    UString text;
     if (hasAppleCrc32)
-        text += QObject::tr("AppleCRC32 ");
-    if (hasAppleFSO)
-        text += QObject::tr("AppleFSO ");
-
+        text += UString("AppleCRC32 ");
+    
     // Add tree item
     UINT8 subtype = Subtypes::UnknownVolume;
     if (!isUnknown) {
@@ -1158,790 +1530,1247 @@ STATUS FfsParser::parseVolumeHeader(const QByteArray & volume, const UINT32 pare
             subtype = Subtypes::Ffs3Volume;
         else if (isNvramVolume)
             subtype = Subtypes::NvramVolume;
+        else if (isAppleMicrocodeVolume)
+            subtype = Subtypes::AppleMicrocodeVolume;
     }
-    index = model->addItem(Types::Volume, subtype, name, text, info, header, body, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
+    index = model->addItem(localOffset, Types::Volume, subtype, name, text, info, header, body, UByteArray(), Movable, parent);
+    
+    // Set parsing data for created volume
+    VOLUME_PARSING_DATA pdata = {};
+    pdata.emptyByte = emptyByte;
+    pdata.ffsVersion = ffsVersion;
+    pdata.hasExtendedHeader = hasExtendedHeader ? TRUE : FALSE;
+    pdata.extendedHeaderGuid = extendedHeaderGuid;
+    pdata.alignment = alignment;
+    pdata.revision = volumeHeader->Revision;
+    pdata.hasAppleCrc32 = hasAppleCrc32;
+    pdata.hasValidUsedSpace = FALSE; // Will be updated later, if needed
+    pdata.usedSpace = usedSpace;
+    pdata.isWeakAligned = (volumeHeader->Revision > 1 && (volumeHeader->Attributes & EFI_FVB2_WEAK_ALIGNMENT));
+    model->setParsingData(index, UByteArray((const char*)&pdata, sizeof(pdata)));
+    
     // Show messages
     if (isUnknown)
-        msg(QObject::tr("parseVolumeHeader: unknown file system %1").arg(guidToQString(volumeHeader->FileSystemGuid)), index);
+        msg(usprintf("%s: unknown file system ", __FUNCTION__) + guidToUString(volumeHeader->FileSystemGuid), index);
     if (msgInvalidChecksum)
-        msg(QObject::tr("parseVolumeHeader: volume header checksum is invalid"), index);
+        msg(usprintf("%s: volume header checksum is invalid", __FUNCTION__), index);
     if (msgAlignmentBitsSet)
-        msg(QObject::tr("parseVolumeHeader: alignment bits set on volume without alignment capability"), index);
+        msg(usprintf("%s: alignment bits set on volume without alignment capability", __FUNCTION__), index);
     if (msgUnaligned)
-        msg(QObject::tr("parseVolumeHeader: unaligned volume"), index);
+        msg(usprintf("%s: unaligned volume", __FUNCTION__), index);
     if (msgUnknownRevision)
-        msg(QObject::tr("parseVolumeHeader: unknown volume revision %1").arg(volumeHeader->Revision), index);
-
-    return ERR_SUCCESS;
+        msg(usprintf("%s: unknown volume revision %u", __FUNCTION__, volumeHeader->Revision), index);
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::findNextVolume(const QModelIndex & index, const QByteArray & bios, const UINT32 parentOffset, const UINT32 volumeOffset, UINT32 & nextVolumeOffset)
+bool FfsParser::intelMicrocodeHeaderValid(const INTEL_MICROCODE_HEADER* ucodeHeader)
 {
-    int nextIndex = bios.indexOf(EFI_FV_SIGNATURE, volumeOffset);
-    if (nextIndex < EFI_FV_SIGNATURE_OFFSET)
-        return ERR_VOLUMES_NOT_FOUND;
-
-    // Check volume header to be sane
-    for (; nextIndex > 0; nextIndex = bios.indexOf(EFI_FV_SIGNATURE, nextIndex + 1)) {
-        const EFI_FIRMWARE_VOLUME_HEADER* volumeHeader = (const EFI_FIRMWARE_VOLUME_HEADER*)(bios.constData() + nextIndex - EFI_FV_SIGNATURE_OFFSET);
-        if (volumeHeader->FvLength < sizeof(EFI_FIRMWARE_VOLUME_HEADER) + 2 * sizeof(EFI_FV_BLOCK_MAP_ENTRY) || volumeHeader->FvLength >= 0xFFFFFFFFUL) {
-            msg(QObject::tr("findNextVolume: volume candidate at offset %1h skipped, has invalid FvLength %2h").hexarg(parentOffset + (nextIndex - EFI_FV_SIGNATURE_OFFSET)).hexarg2(volumeHeader->FvLength, 16), index);
-            continue;
-        }
-        if (volumeHeader->Reserved != 0xFF && volumeHeader->Reserved != 0x00) {
-            msg(QObject::tr("findNextVolume: volume candidate at offset %1h skipped, has invalid Reserved byte value %2").hexarg(parentOffset + (nextIndex - EFI_FV_SIGNATURE_OFFSET)).hexarg2(volumeHeader->Reserved, 2), index);
-            continue;
-        }
-        if (volumeHeader->Revision != 1 && volumeHeader->Revision != 2) {
-            msg(QObject::tr("findNextVolume: volume candidate at offset %1h skipped, has invalid Revision byte value %2").hexarg(parentOffset + (nextIndex - EFI_FV_SIGNATURE_OFFSET)).hexarg2(volumeHeader->Revision, 2), index);
-            continue;
-        }
-        // All checks passed, volume found
-        break;
+    bool reservedBytesValid = true;
+    
+    // Check data size to be multiple of 4 and less than 0x1000000
+    if (ucodeHeader->DataSize % 4 != 0 ||
+        ucodeHeader->DataSize > 0xFFFFFF) {
+        return false;
     }
-    // No more volumes found
-    if (nextIndex < EFI_FV_SIGNATURE_OFFSET)
-        return ERR_VOLUMES_NOT_FOUND;
-
-    nextVolumeOffset = nextIndex - EFI_FV_SIGNATURE_OFFSET;
-    return ERR_SUCCESS;
+    
+    // Check TotalSize to be greater or equal than DataSize and less than 0x1000000
+    if (ucodeHeader->TotalSize < ucodeHeader->DataSize ||
+        ucodeHeader->TotalSize > 0xFFFFFF) {
+        return false;
+    }
+    
+    // Check date to be sane
+    // Check day to be in 0x01-0x09, 0x10-0x19, 0x20-0x29, 0x30-0x31
+    if (ucodeHeader->DateDay < 0x01 ||
+        (ucodeHeader->DateDay > 0x09 && ucodeHeader->DateDay < 0x10) ||
+        (ucodeHeader->DateDay > 0x19 && ucodeHeader->DateDay < 0x20) ||
+        (ucodeHeader->DateDay > 0x29 && ucodeHeader->DateDay < 0x30) ||
+        ucodeHeader->DateDay > 0x31) {
+        return false;
+    }
+    // Check month to be in 0x01-0x09, 0x10-0x12
+    if (ucodeHeader->DateMonth < 0x01 ||
+        (ucodeHeader->DateMonth > 0x09 && ucodeHeader->DateMonth < 0x10) ||
+        ucodeHeader->DateMonth > 0x12) {
+        return FALSE;
+    }
+    // Check year to be in 0x1990-0x1999, 0x2000-0x2009, 0x2010-0x2019, 0x2020-0x2029, 0x2030-0x2030, 0x2040-0x2049
+    if (ucodeHeader->DateYear < 0x1990 ||
+        (ucodeHeader->DateYear > 0x1999 && ucodeHeader->DateYear < 0x2000) ||
+        (ucodeHeader->DateYear > 0x2009 && ucodeHeader->DateYear < 0x2010) ||
+        (ucodeHeader->DateYear > 0x2019 && ucodeHeader->DateYear < 0x2020) ||
+        (ucodeHeader->DateYear > 0x2029 && ucodeHeader->DateYear < 0x2030) ||
+        (ucodeHeader->DateYear > 0x2039 && ucodeHeader->DateYear < 0x2040) ||
+        ucodeHeader->DateYear > 0x2049) {
+        return FALSE;
+    }
+    // Check HeaderType to be 1.
+    if (ucodeHeader->HeaderType != 1) {
+        return FALSE;
+    }
+    // Check LoaderRevision to be 1.
+    if (ucodeHeader->LoaderRevision != 1) {
+        return FALSE;
+    }
+    
+    return TRUE;
 }
 
-STATUS FfsParser::getVolumeSize(const QByteArray & bios, UINT32 volumeOffset, UINT32 & volumeSize, UINT32 & bmVolumeSize)
+bool FfsParser::amdMicrocodeHeaderValid(const AMD_MICROCODE_HEADER* ucodeHeader)
 {
-    // Check that there is space for the volume header and at least two block map entries.
-    if ((UINT32)bios.size() < volumeOffset + sizeof(EFI_FIRMWARE_VOLUME_HEADER) + 2 * sizeof(EFI_FV_BLOCK_MAP_ENTRY))
-        return ERR_INVALID_VOLUME;
+    UINT8  DateDay = amdMicrocodeGetDay(ucodeHeader);
+    UINT8  DateMonth = amdMicrocodeGetMonth(ucodeHeader);
+    UINT16 DateYear = amdMicrocodeGetYear(ucodeHeader);
 
-    // Populate volume header
-    const EFI_FIRMWARE_VOLUME_HEADER* volumeHeader = (const EFI_FIRMWARE_VOLUME_HEADER*)(bios.constData() + volumeOffset);
-
-    // Check volume signature
-    if (QByteArray((const char*)&volumeHeader->Signature, sizeof(volumeHeader->Signature)) != EFI_FV_SIGNATURE)
-        return ERR_INVALID_VOLUME;
-
-    // Calculate volume size using BlockMap
-    const EFI_FV_BLOCK_MAP_ENTRY* entry = (const EFI_FV_BLOCK_MAP_ENTRY*)(bios.constData() + volumeOffset + sizeof(EFI_FIRMWARE_VOLUME_HEADER));
-    UINT32 calcVolumeSize = 0;
-    while (entry->NumBlocks != 0 && entry->Length != 0) {
-        if ((void*)entry > bios.constData() + bios.size())
-            return ERR_INVALID_VOLUME;
-
-        calcVolumeSize += entry->NumBlocks * entry->Length;
-        entry += 1;
+    // Check day to be in 0x01-0x09, 0x10-0x19, 0x20-0x29, 0x30-0x31
+    if (DateDay < 0x01 ||
+        (DateDay > 0x09 && DateDay < 0x10) ||
+        (DateDay > 0x19 && DateDay < 0x20) ||
+        (DateDay > 0x29 && DateDay < 0x30) ||
+        DateDay > 0x31) {
+        return FALSE;
     }
 
-    volumeSize = volumeHeader->FvLength;
-    bmVolumeSize = calcVolumeSize;
+    // Check month to be in 0x01-0x09, 0x10-0x12
+    if (DateMonth < 0x01 ||
+        (DateMonth > 0x09 && DateMonth < 0x10) ||
+        DateMonth > 0x12) {
+        return FALSE;
+    }
 
-    if (volumeSize == 0)
-        return ERR_INVALID_VOLUME;
+    // Check year to be in 0x2001-0x2009, 0x2010-0x2019, 0x2020-0x2029
+    if (DateYear < 0x2001 ||
+        (DateYear > 0x2009 && DateYear < 0x2010) ||
+        (DateYear > 0x2019 && DateYear < 0x2020) ||
+        (DateYear > 0x2029)) {
+        return FALSE;
+    }
 
-    return ERR_SUCCESS;
+    UINT32 microcodeDataLen = amdMicrocodeGetDataSize(ucodeHeader);
+    UINT32 cpuId = amdMicrocodeGetCpuId(ucodeHeader);
+
+    if (cpuId == 0x00000F00 && microcodeDataLen != 0x10 && microcodeDataLen != 0x20) {
+        return FALSE;
+    }
+
+    if (((ucodeHeader->LoaderID >> 8) & 0xFF) != 0x80) {
+        return FALSE;
+    }
+
+    if (ucodeHeader->NorthBridgeVEN_ID != 0x0000 && ucodeHeader->NorthBridgeVEN_ID != 0x1022) {
+        return FALSE;
+    }
+
+    if (ucodeHeader->SouthBridgeVEN_ID != 0x0000 && ucodeHeader->SouthBridgeVEN_ID != 0x1022) {
+        return FALSE;
+    }
+
+    if (ucodeHeader->BiosApiRevision != 0x00 && ucodeHeader->BiosApiRevision != 0x01) {
+        return FALSE;
+    }
+
+    if (ucodeHeader->LoadControl > 0x0F && ucodeHeader->LoadControl != 0xAA) {
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
-STATUS FfsParser::parseVolumeNonUefiData(const QByteArray & data, const UINT32 parentOffset, const QModelIndex & index)
+USTATUS FfsParser::findNextRawAreaItem(const UModelIndex & index, const UINT32 localOffset, UINT8 & nextItemType, UINT32 & nextItemOffset, UINT32 & nextItemSize, UINT32 & nextItemAlternativeSize)
 {
-    // Sanity check
-    if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
-    // Get parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-
-    // Modify it
-    pdata.offset += parentOffset;
-
-    // Search for VTF GUID backwards in received data
-    QByteArray padding = data;
-    QByteArray vtf;
-    INT32 vtfIndex = data.lastIndexOf(EFI_FFS_VOLUME_TOP_FILE_GUID);
-    if (vtfIndex >= 0) { // VTF candidate found inside non-UEFI data
-        padding = data.left(vtfIndex);
-        vtf = data.mid(vtfIndex);
-        const EFI_FFS_FILE_HEADER* fileHeader = (const EFI_FFS_FILE_HEADER*)vtf.constData();
-        if ((UINT32)vtf.size() < sizeof(EFI_FFS_FILE_HEADER) // VTF candidate is too small to be a real VTF in FFSv1/v2 volume
-            || (pdata.ffsVersion == 3
-                && (fileHeader->Attributes & FFS_ATTRIB_LARGE_FILE)
-                && (UINT32)vtf.size() < sizeof(EFI_FFS_FILE_HEADER2))) { // VTF candidate is too small to be a real VTF in FFSv3 volume
-            vtfIndex = -1;
-            padding = data;
-            vtf.clear();
-        }
-    }
-
-    // Add non-UEFI data first
-    // Get info
-    QString info = QObject::tr("Full size: %1h (%2)").hexarg(padding.size()).arg(padding.size());
-
-    // Add padding tree item
-    QModelIndex paddingIndex = model->addItem(Types::Padding, Subtypes::DataPadding, QObject::tr("Non-UEFI data"), "", info, QByteArray(), padding, QByteArray(), true, parsingDataToQByteArray(pdata), index);
-    msg(QObject::tr("parseVolumeNonUefiData: non-UEFI data found in volume's free space"), paddingIndex);
-
-    if (vtfIndex >= 0) {
-        // Get VTF file header
-        QByteArray header = vtf.left(sizeof(EFI_FFS_FILE_HEADER));
-        const EFI_FFS_FILE_HEADER* fileHeader = (const EFI_FFS_FILE_HEADER*)header.constData();
-        if (pdata.ffsVersion == 3 && (fileHeader->Attributes & FFS_ATTRIB_LARGE_FILE)) {
-            header = vtf.left(sizeof(EFI_FFS_FILE_HEADER2));
-        }
-
-        //Parse VTF file header
-        QModelIndex fileIndex;
-        STATUS result = parseFileHeader(vtf, parentOffset + vtfIndex, index, fileIndex);
-        if (result) {
-            msg(QObject::tr("parseVolumeNonUefiData: VTF file header parsing failed with error \"%1\"").arg(errorCodeToQString(result)), index);
+    UByteArray data = model->body(index);
+    UINT32 dataSize = (UINT32)data.size();
+    
+    if (dataSize < sizeof(UINT32))
+        return U_STORES_NOT_FOUND;
+    
+    UINT32 offset = localOffset;
+    for (; offset < dataSize - sizeof(UINT32); offset++) {
+        const UINT32* currentPos = (const UINT32*)(data.constData() + offset);
+        UINT32 restSize = dataSize - offset;
+        if (readUnaligned(currentPos) == INTEL_MICROCODE_HEADER_VERSION_1) { // Intel microcode
+            // Check data size
+            if (restSize < sizeof(INTEL_MICROCODE_HEADER)) {
+                continue;
+            }
             
-            // Add the rest as non-UEFI data too
-            pdata.offset += vtfIndex;
-            // Get info
-            QString info = QObject::tr("Full size: %1h (%2)").hexarg(vtf.size()).arg(vtf.size());
+            // Check microcode header candidate
+            const INTEL_MICROCODE_HEADER* ucodeHeader = (const INTEL_MICROCODE_HEADER*)currentPos;
+            if (FALSE == intelMicrocodeHeaderValid(ucodeHeader)) {
+                continue;
+            }
+            
+            // Check size candidate
+            if (ucodeHeader->TotalSize == 0)
+                continue;
+            
+            // All checks passed, microcode found
+            nextItemType = Types::IntelMicrocode;
+            nextItemSize = ucodeHeader->TotalSize;
+            nextItemAlternativeSize = ucodeHeader->TotalSize;
+            nextItemOffset = offset;
+            break;
+        }
+        else if (readUnaligned(currentPos) == EFI_FV_SIGNATURE) {
+            if (offset < EFI_FV_SIGNATURE_OFFSET)
+                continue;
 
-            // Add padding tree item
-            QModelIndex paddingIndex = model->addItem(Types::Padding, Subtypes::DataPadding, QObject::tr("Non-UEFI data"), "", info, QByteArray(), vtf, QByteArray(), true, parsingDataToQByteArray(pdata), index);
-            msg(QObject::tr("parseVolumeNonUefiData: non-UEFI data found in volume's free space"), paddingIndex);
+            // Prevent OOB access
+            if (restSize + EFI_FV_SIGNATURE_OFFSET < sizeof(EFI_FIRMWARE_VOLUME_HEADER)) {
+                continue;
+            }
+            const EFI_FIRMWARE_VOLUME_HEADER* volumeHeader = (const EFI_FIRMWARE_VOLUME_HEADER*)(data.constData() + offset - EFI_FV_SIGNATURE_OFFSET);
+            restSize -= sizeof(EFI_FIRMWARE_VOLUME_HEADER);
+            if (volumeHeader->FvLength < sizeof(EFI_FIRMWARE_VOLUME_HEADER) + 2 * sizeof(EFI_FV_BLOCK_MAP_ENTRY) || volumeHeader->FvLength >= 0xFFFFFFFFUL) {
+                continue;
+            }
+            if (volumeHeader->Revision != 1 && volumeHeader->Revision != 2) {
+                continue;
+            }
+            
+            // Calculate alternative volume size using its BlockMap
+            nextItemAlternativeSize = 0;
+
+            // Prevent OOB access
+            if (restSize + EFI_FV_SIGNATURE_OFFSET < sizeof(EFI_FIRMWARE_VOLUME_HEADER)) {
+                continue;
+            }
+            const EFI_FV_BLOCK_MAP_ENTRY* entry = (const EFI_FV_BLOCK_MAP_ENTRY*)(data.constData() + offset - EFI_FV_SIGNATURE_OFFSET + sizeof(EFI_FIRMWARE_VOLUME_HEADER));
+            restSize -= sizeof(EFI_FV_BLOCK_MAP_ENTRY);
+            while (entry->NumBlocks != 0 && entry->Length != 0) {
+                // Check if we are past the end of the volume
+                if (restSize + EFI_FV_SIGNATURE_OFFSET < sizeof(EFI_FV_BLOCK_MAP_ENTRY)) {
+                    // This volume is broken, but we can't use continue here because we need to continue the outer loop
+                    goto continue_searching;
+                }
+                
+                nextItemAlternativeSize += entry->NumBlocks * entry->Length;
+                restSize -= sizeof(EFI_FV_BLOCK_MAP_ENTRY);
+                entry += 1;
+            }
+            
+            // All checks passed, volume found
+            nextItemType = Types::Volume;
+            nextItemSize = (UINT32)volumeHeader->FvLength;
+            nextItemOffset = offset - EFI_FV_SIGNATURE_OFFSET;
+            break;
+continue_searching: {}
+        }
+        else if (readUnaligned(currentPos) == BPDT_GREEN_SIGNATURE
+                 || readUnaligned(currentPos) == BPDT_YELLOW_SIGNATURE) {
+            // Check data size
+            if (restSize < sizeof(BPDT_HEADER))
+                continue;
+            
+            const BPDT_HEADER *bpdtHeader = (const BPDT_HEADER *)currentPos;
+                        
+            // Check NumEntries to be sane
+            if (bpdtHeader->NumEntries > 0x100)
+                continue;
+            
+            // Check HeaderVersion to be 1
+            if (bpdtHeader->HeaderVersion != BPDT_HEADER_VERSION_1) // Check only for IFWI 2.0 headers in raw areas
+                continue;
+            
+            // Check RedundancyFlag to be 0 or 1
+            if (bpdtHeader->RedundancyFlag != 0 && bpdtHeader->RedundancyFlag != 1) // Check only for IFWI 2.0 headers in raw areas
+                continue;
+            
+            UINT32 ptBodySize = bpdtHeader->NumEntries * sizeof(BPDT_ENTRY);
+            UINT32 ptSize = sizeof(BPDT_HEADER) + ptBodySize;
+            // Check data size again
+            if (restSize < ptSize)
+                continue;
+            
+            UINT32 sizeCandidate = 0;
+            // Parse partition table
+            const BPDT_ENTRY* firstPtEntry = (const BPDT_ENTRY*)((const UINT8*)bpdtHeader + sizeof(BPDT_HEADER));
+            for (UINT16 i = 0; i < bpdtHeader->NumEntries; i++) {
+                // Populate entry header
+                const BPDT_ENTRY* ptEntry = firstPtEntry + i;
+                // Check that entry is present in the image
+                if (ptEntry->Offset != 0
+                    && ptEntry->Offset != 0xFFFFFFFF
+                    && ptEntry->Size != 0
+                    && sizeCandidate < ptEntry->Offset + ptEntry->Size) {
+                    sizeCandidate = ptEntry->Offset + ptEntry->Size;
+                }
+            }
+            
+            // Check size candidate
+            if (sizeCandidate == 0 || sizeCandidate > restSize) {
+                msg(usprintf("%s: invalid BpdtStore size (sizeCandidate = %Xh, restSize = %Xh)", __FUNCTION__, sizeCandidate, restSize), index);
+                continue;
+            }
+            
+            // All checks passed, BPDT found
+            nextItemType = Types::BpdtStore;
+            nextItemSize = sizeCandidate;
+            nextItemAlternativeSize = sizeCandidate;
+            nextItemOffset = offset;
+            break;
+        }
+        else if (readUnaligned(currentPos) == INSYDE_FLASH_DEVICE_MAP_SIGNATURE) {
+            // Check data size
+            if (restSize < sizeof(INSYDE_FLASH_DEVICE_MAP_HEADER))
+                continue;
+            
+            const INSYDE_FLASH_DEVICE_MAP_HEADER *fdmHeader = (const INSYDE_FLASH_DEVICE_MAP_HEADER *)currentPos;
+            
+            if (restSize < fdmHeader->Size)
+                continue;
+            
+            if (fdmHeader->Revision > 4) {
+                msg(usprintf("%s: Insyde Flash Device Map candidate with unknown revision %u", __FUNCTION__, fdmHeader->Revision), index);
+                continue;
+            }
+            
+            // All checks passed, FDM found
+            nextItemType = Types::InsydeFlashDeviceMapStore;
+            nextItemSize = fdmHeader->Size;
+            nextItemAlternativeSize = fdmHeader->Size;
+            nextItemOffset = offset;
+            break;
+        }
+#ifdef U_ENABLE_NVRAM_PARSING_SUPPORT
+        else if (readUnaligned(currentPos) == DVAR_STORE_SIGNATURE) {
+            // Check data size
+            if (restSize < sizeof(DVAR_STORE_HEADER))
+                continue;
+            
+            const DVAR_STORE_HEADER *dvarHeader = (const DVAR_STORE_HEADER *)currentPos;
+            UINT32 storeSize = 0xFFFFFFFF - dvarHeader->StoreSizeC;
+            if (restSize < storeSize)
+                continue;
+            
+            // All checks passed, FDM found
+            nextItemType = Types::DellDvarStore;
+            nextItemSize = storeSize;
+            nextItemAlternativeSize = storeSize;
+            nextItemOffset = offset;
+            break;
+        }
+#endif
+
+        // Since the AMD microcode header lacks a clear signature, we attempt to parse it as a last resort
+        else if (restSize >= sizeof(AMD_MICROCODE_HEADER) + 0x44) {
+            const AMD_MICROCODE_HEADER* ucodeHeader = (const AMD_MICROCODE_HEADER*)currentPos;
+            if (FALSE == amdMicrocodeHeaderValid(ucodeHeader)) {
+                continue;
+            }
+
+            if (readUnaligned(currentPos + 0x40) == 0x00000000) {
+                continue;
+            }
+
+            UINT32 microcodeLen = amdMicrocodeGetSize(ucodeHeader);
+            if (microcodeLen == 0 || restSize < microcodeLen) {
+                continue;
+            }
+
+            nextItemType = Types::AmdMicrocode;
+            nextItemSize = microcodeLen;
+            nextItemAlternativeSize = microcodeLen;
+            nextItemOffset = offset;
+            break;
         }
     }
-
-    return ERR_SUCCESS;
+    
+    // No more stores found
+    if (offset >= dataSize - sizeof(UINT32)) {
+        return U_STORES_NOT_FOUND;
+    }
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseVolumeBody(const QModelIndex & index)
+USTATUS FfsParser::parseVolumeNonUefiData(const UByteArray & data, const UINT32 localOffset, const UModelIndex & index)
 {
     // Sanity check
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
+        return U_INVALID_PARAMETER;
 
+    // If parent has the same offset as this item, then we are in infinite recursion, so we break here.
+    if (model->offset(index) == localOffset)
+        return U_INVALID_PARAMETER;
+    
+    // Add padding tree item
+    UModelIndex paddingIndex = model->addItem(localOffset, Types::Padding, Subtypes::DataPadding, UString("Non-UEFI data"), UString(), UString(), UByteArray(), data, UByteArray(), Fixed, index);
+    msg(usprintf("%s: non-UEFI data found in volume free space", __FUNCTION__), paddingIndex);
+    
+    // Parse contents as raw area
+    return parseRawArea(paddingIndex);
+}
+
+USTATUS FfsParser::parseVolumeBody(const UModelIndex & index, const bool probe)
+{
+    // Sanity check
+    if (!index.isValid()) {
+        return U_INVALID_PARAMETER;
+    }
+    
     // Get volume header size and body
-    QByteArray volumeBody = model->body(index);
-    UINT32 volumeHeaderSize = model->header(index).size();
-
-    // Get parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-    UINT32 offset = pdata.offset;
-
-    // Parse VSS NVRAM volumes with a dedicated function
-    if (model->subtype(index) == Subtypes::NvramVolume)
-        return parseNvramVolumeBody(index);
-
-    if (pdata.ffsVersion != 2 && pdata.ffsVersion != 3) // Don't parse unknown volumes
-        return ERR_SUCCESS;
-
+    UByteArray volumeBody = model->body(index);
+    UINT32 volumeHeaderSize = model->headerSize(index);
+    
+    // Parse NVRAM volume with a dedicated function
+    if (model->subtype(index) == Subtypes::NvramVolume) {
+        return nvramParser->parseNvramVolumeBody(index);
+    }
+    
+    // Parse Microcode volume with a dedicated function
+    if (model->subtype(index) == Subtypes::AppleMicrocodeVolume) {
+        return parseMicrocodeVolumeBody(index);
+    }
+    
+    // Get required values from parsing data
+    UINT8 emptyByte = 0xFF;
+    UINT8 ffsVersion = 2;
+    UINT32 usedSpace = 0;
+    UINT8 revision = 2;
+    if (model->hasEmptyParsingData(index) == false) {
+        UByteArray data = model->parsingData(index);
+        const VOLUME_PARSING_DATA* pdata = (const VOLUME_PARSING_DATA*)data.constData();
+        emptyByte = pdata->emptyByte;
+        ffsVersion = pdata->ffsVersion;
+        usedSpace = pdata->usedSpace;
+        revision = pdata->revision;
+    }
+    
+    // Check for unknown FFS version
+    if (ffsVersion != 2 && ffsVersion != 3) {
+        msg(usprintf("%s: unknown FFS version %d", __FUNCTION__, ffsVersion), index);
+        return U_SUCCESS;
+    }
+    
     // Search for and parse all files
-    UINT32 volumeBodySize = volumeBody.size();
+    UINT32 volumeBodySize = (UINT32)volumeBody.size();
     UINT32 fileOffset = 0;
     
     while (fileOffset < volumeBodySize) {
-        UINT32 fileSize = getFileSize(volumeBody, fileOffset, pdata.ffsVersion);
-        // Check file size 
-        if (fileSize < sizeof(EFI_FFS_FILE_HEADER) || fileSize > volumeBodySize - fileOffset) {
-            // Check that we are at the empty space
-            QByteArray header = volumeBody.mid(fileOffset, sizeof(EFI_FFS_FILE_HEADER));
-            if (header.count(pdata.emptyByte) == header.size()) { //Empty space
-                // Check free space to be actually free
-                QByteArray freeSpace = volumeBody.mid(fileOffset);
-                if (freeSpace.count(pdata.emptyByte) != freeSpace.count()) {
-                    // Search for the first non-empty byte
-                    UINT32 i;
-                    UINT32 size = freeSpace.size();
-                    const UINT8* current = (UINT8*)freeSpace.constData();
-                    for (i = 0; i < size; i++) {
-                        if (*current++ != pdata.emptyByte)
-                            break;
-                    }
-
-                    // Align found index to file alignment
-                    // It must be possible because minimum 16 bytes of empty were found before
-                    if (i != ALIGN8(i))
-                        i = ALIGN8(i) - 8;
-
-                    // Construct parsing data
-                    pdata.offset = offset + volumeHeaderSize + fileOffset;
-
-                    // Add all bytes before as free space
-                    if (i > 0) {
-                        QByteArray free = freeSpace.left(i);
-
-                        // Get info
-                        QString info = QObject::tr("Full size: %1h (%2)").hexarg(free.size()).arg(free.size());
-
-                        // Add free space item
-                        model->addItem(Types::FreeSpace, 0, QObject::tr("Volume free space"), "", info, QByteArray(), free, QByteArray(), false, parsingDataToQByteArray(pdata), index);
-                    }
-
-                    // Parse non-UEFI data 
-                    parseVolumeNonUefiData(freeSpace.mid(i), volumeHeaderSize + fileOffset + i, index);
+        UINT32 fileSize = getFileSize(volumeBody, fileOffset, ffsVersion, revision);
+        
+        if (fileSize == 0) {
+            msg(usprintf("%s: file header parsing failed with invalid size", __FUNCTION__), index);
+            break; // Exit from parsing loop
+        }
+        
+        // Check that we are at the empty space
+        UByteArray header = volumeBody.mid(fileOffset, (int)std::min(sizeof(EFI_FFS_FILE_HEADER), (size_t)volumeBodySize - fileOffset));
+        if (isUniformByte(header, emptyByte)) { // Empty space
+            // Check volume usedSpace entry to be valid
+            if (usedSpace > 0 && usedSpace == fileOffset + volumeHeaderSize) {
+                if (model->hasEmptyParsingData(index) == false) {
+                    UByteArray data = model->parsingData(index);
+                    VOLUME_PARSING_DATA* pdata = (VOLUME_PARSING_DATA*)data.data();
+                    pdata->hasValidUsedSpace = TRUE;
+                    model->setParsingData(index, data);
+                    model->setText(index, model->text(index) + "UsedSpace ");
                 }
-                else {
-                    // Construct parsing data
-                    pdata.offset = offset + volumeHeaderSize + fileOffset;
-
-                    // Get info
-                    QString info = QObject::tr("Full size: %1h (%2)").hexarg(freeSpace.size()).arg(freeSpace.size());
-
+            }
+            
+            // Check free space to be actually free
+            UByteArray freeSpace = volumeBody.mid(fileOffset);
+            if (!isUniformByte(freeSpace, emptyByte)) {
+                // Search for the first non-empty byte
+                UINT32 i;
+                UINT32 size = (UINT32)freeSpace.size();
+                const UINT8* current = (UINT8*)freeSpace.constData();
+                for (i = 0; i < size; i++) {
+                    if (*current++ != emptyByte) {
+                        break; // Exit from parsing loop
+                    }
+                }
+                
+                // Align found index to file alignment
+                // It must be possible because minimum 16 bytes of empty were found before
+                if (i != ALIGN8(i)) {
+                    i = ALIGN8(i) - 8;
+                }
+                
+                // Add all bytes before as free space
+                if (i > 0) {
+                    if (probe)
+                        return U_STORES_NOT_FOUND;
+                    UByteArray free = freeSpace.left(i);
+                    
                     // Add free space item
-                    model->addItem(Types::FreeSpace, 0, QObject::tr("Volume free space"), "", info, QByteArray(), freeSpace, QByteArray(), false, parsingDataToQByteArray(pdata), index);
+                    model->addItem(volumeHeaderSize + fileOffset, Types::FreeSpace, 0, UString("Volume free space"), UString(), UString(), UByteArray(), free, UByteArray(), Movable, index);
                 }
-                break; // Exit from parsing loop
+                
+                // Parse non-UEFI data
+                parseVolumeNonUefiData(freeSpace.mid(i), volumeHeaderSize + fileOffset + i, index);
             }
-            else { //File space
-                // Parse non-UEFI data 
-                parseVolumeNonUefiData(volumeBody.mid(fileOffset), volumeHeaderSize + fileOffset, index);
-                break; // Exit from parsing loop
+            else {
+                // Add free space item
+                model->addItem(volumeHeaderSize + fileOffset, Types::FreeSpace, 0, UString("Volume free space"), UString(), UString(), UByteArray(), freeSpace, UByteArray(), Movable, index);
             }
+            
+            break; // Exit from parsing loop
         }
-
-        // Get file header
-        QByteArray file = volumeBody.mid(fileOffset, fileSize);
-        QByteArray header = file.left(sizeof(EFI_FFS_FILE_HEADER));
-        const EFI_FFS_FILE_HEADER* fileHeader = (const EFI_FFS_FILE_HEADER*)header.constData();
-        if (pdata.ffsVersion == 3 && (fileHeader->Attributes & FFS_ATTRIB_LARGE_FILE)) {
-            header = file.left(sizeof(EFI_FFS_FILE_HEADER2));
+        
+        // We aren't at the end of empty space
+        // Check that the remaining space can still have a file in it
+        if (volumeBodySize - fileOffset < sizeof(EFI_FFS_FILE_HEADER) // Remaining space is smaller than the smallest possible file
+            || volumeBodySize - fileOffset < fileSize) { // Remaining space is smaller than non-empty file size
+            if (probe)
+                return U_STORES_NOT_FOUND;
+            // Parse non-UEFI data
+            parseVolumeNonUefiData(volumeBody.mid(fileOffset), volumeHeaderSize + fileOffset, index);
+            
+            break; // Exit from parsing loop
         }
-
-        //Parse current file's header
-        QModelIndex fileIndex;
-        STATUS result = parseFileHeader(file, volumeHeaderSize + fileOffset, index, fileIndex);
-        if (result)
-            msg(QObject::tr("parseVolumeBody: file header parsing failed with error \"%1\"").arg(errorCodeToQString(result)), index);
-
+        
+        // Parse current file's header
+        UModelIndex fileIndex;
+        USTATUS result = parseFileHeader(volumeBody.mid(fileOffset, fileSize), volumeHeaderSize + fileOffset, index, fileIndex, probe);
+        if (result) {
+            msg(usprintf("%s: file header parsing failed with error ", __FUNCTION__) + errorCodeToUString(result), index);
+        }
+        
         // Move to next file
         fileOffset += fileSize;
+        
+        if (!probe) {
+            // Check for alignment bytes after the current file
+            // Files must be aligned to 8 bytes boundary inside the FFS volume
+            // The alignment byte should be equal to 0xFF (erasePolarity = 1) or 0x00 (erasePolarity = 0)
+            UINT32 numAlignmentBytes = ALIGN8(fileOffset) - fileOffset;
+            
+            // We might be at the very end of the volume, need a check for it
+            if (volumeBodySize < fileOffset + numAlignmentBytes) {
+                numAlignmentBytes = volumeBodySize - fileOffset;
+            }
+            
+            if (numAlignmentBytes > 0) {
+                UByteArray alignmentBytes = volumeBody.mid(fileOffset, numAlignmentBytes);
+                // Check alignment bytes to be sane
+                if (!isUniformByte(alignmentBytes, emptyByte)) {
+                    msg(usprintf("%s: unexpected bytes found in file alignment area, should all be %s", __FUNCTION__, emptyByte ? "0xFF" : "0x00"), fileIndex);
+                    
+                    // Add unexpected alignment bytes to tree item info
+                    UString info;
+                    for (UINT8 i = 0; i < numAlignmentBytes; i++) {
+                        info += usprintf("%02X ", alignmentBytes.at(i));
+                    }
+                    model->addInfo(fileIndex, UString("\nAlignment bytes: ") + info);
+                }
+                
+                // Store alignment bytes for upholding parsing pre/post-conditions (aka "every byte is accounted for")
+                model->setAlignmentBytes(fileIndex, alignmentBytes);
+            }
+        }
+        
+        // Adjust fileOffset
         fileOffset = ALIGN8(fileOffset);
     }
-
+    
     // Check for duplicate GUIDs
     for (int i = 0; i < model->rowCount(index); i++) {
-        QModelIndex current = index.child(i, 0);
-        // Skip non-file entries and pad files
-        if (model->type(current) != Types::File || model->subtype(current) == EFI_FV_FILETYPE_PAD)
-            continue;
+        UModelIndex current = index.model()->index(i, 0, index);
         
-        // Get current file parsing data
-        PARSING_DATA currentPdata = parsingDataFromQModelIndex(current);
-        QByteArray currentGuid((const char*)&currentPdata.file.guid, sizeof(EFI_GUID));
-
+        // Skip non-file entries and padding files
+        if (model->type(current) != Types::File
+            || model->subtype(current) == EFI_FV_FILETYPE_PAD) {
+            continue;
+        }
+        
+        // Get current file GUID
+        UByteArray currentGuid(model->header(current).constData(), sizeof(EFI_GUID));
+        
         // Check files after current for having an equal GUID
         for (int j = i + 1; j < model->rowCount(index); j++) {
-            QModelIndex another = index.child(j, 0);
-
-            // Skip non-file entries
-            if (model->type(another) != Types::File)
-                continue;
+            UModelIndex another = index.model()->index(j, 0, index);
             
-            // Get another file parsing data
-            PARSING_DATA anotherPdata = parsingDataFromQModelIndex(another);
-            QByteArray anotherGuid((const char*)&anotherPdata.file.guid, sizeof(EFI_GUID));
-
+            // Skip non-file entries
+            if (model->type(another) != Types::File) {
+                continue;
+            }
+            
+            // Get another file GUID
+            UByteArray anotherGuid(model->header(another).constData(), sizeof(EFI_GUID));
+            
             // Check GUIDs for being equal
             if (currentGuid == anotherGuid) {
-                msg(QObject::tr("parseVolumeBody: file with duplicate GUID %1").arg(guidToQString(anotherPdata.file.guid)), another);
+                msg(usprintf("%s: file with duplicate GUID ", __FUNCTION__) + guidToUString(readUnaligned((EFI_GUID*)(anotherGuid.data()))), another);
             }
         }
     }
-
-    //Parse bodies
+    
+    // Parse bodies
     for (int i = 0; i < model->rowCount(index); i++) {
-        QModelIndex current = index.child(i, 0);
+        UModelIndex current = index.model()->index(i, 0, index);
+        
         switch (model->type(current)) {
-        case Types::File:
-            parseFileBody(current);
-            break;
-        case Types::Padding:
-        case Types::FreeSpace:
-            // No parsing required
-            break;
-        default:
-            return ERR_UNKNOWN_ITEM_TYPE;
+            case Types::File:
+                parseFileBody(current);
+                break;
+            case Types::Padding:
+            case Types::FreeSpace:
+                // No parsing required
+                break;
+            default:
+                return U_UNKNOWN_ITEM_TYPE;
         }
     }
-
-    return ERR_SUCCESS;
+    
+    return U_SUCCESS;
 }
 
-UINT32 FfsParser::getFileSize(const QByteArray & volume, const UINT32 fileOffset, const UINT8 ffsVersion)
+UINT32 FfsParser::getFileSize(const UByteArray & volume, const UINT32 fileOffset, const UINT8 ffsVersion, const UINT8 revision)
 {
+    if ((UINT32)volume.size() < fileOffset + sizeof(EFI_FFS_FILE_HEADER)) {
+        return 0;
+    }
+    
+    const EFI_FFS_FILE_HEADER* fileHeader = (const EFI_FFS_FILE_HEADER*)(volume.constData() + fileOffset);
+    
     if (ffsVersion == 2) {
-        if ((UINT32)volume.size() < fileOffset + sizeof(EFI_FFS_FILE_HEADER))
-            return 0;
-        const EFI_FFS_FILE_HEADER* fileHeader = (const EFI_FFS_FILE_HEADER*)(volume.constData() + fileOffset);
-        return uint24ToUint32(fileHeader->Size);
+        UINT32 size = uint24ToUint32(fileHeader->Size);
+        // Special case of Lenovo large file insize FFSv2 Rev2 volume
+        if (revision == 2 && (fileHeader->Attributes & FFS_ATTRIB_LARGE_FILE)) {
+            if ((UINT32)volume.size() < fileOffset + sizeof(EFI_FFS_FILE_HEADER2_LENOVO)) {
+                return 0;
+            }
+            
+            const EFI_FFS_FILE_HEADER2_LENOVO* fileHeader2Lenovo = (const EFI_FFS_FILE_HEADER2_LENOVO*)(volume.constData() + fileOffset);
+            return (UINT32)fileHeader2Lenovo->ExtendedSize;
+        }
+        
+        return size;
     }
     else if (ffsVersion == 3) {
-        if ((UINT32)volume.size() < fileOffset + sizeof(EFI_FFS_FILE_HEADER2))
-            return 0;
-        const EFI_FFS_FILE_HEADER2* fileHeader = (const EFI_FFS_FILE_HEADER2*)(volume.constData() + fileOffset);
-        if (fileHeader->Attributes & FFS_ATTRIB_LARGE_FILE)
-            return fileHeader->ExtendedSize;
-        else
-            return uint24ToUint32(fileHeader->Size);
+        if (fileHeader->Attributes & FFS_ATTRIB_LARGE_FILE) {
+            if ((UINT32)volume.size() < fileOffset + sizeof(EFI_FFS_FILE_HEADER2)) {
+                return 0;
+            }
+            
+            const EFI_FFS_FILE_HEADER2* fileHeader2 = (const EFI_FFS_FILE_HEADER2*)(volume.constData() + fileOffset);
+            return (UINT32)fileHeader2->ExtendedSize;
+        }
+        
+        return uint24ToUint32(fileHeader->Size);
     }
-    else
-        return 0;
+    
+    return 0;
 }
 
-STATUS FfsParser::parseFileHeader(const QByteArray & file, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+USTATUS FfsParser::parseFileHeader(const UByteArray & file, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index, const bool probe)
 {
     // Sanity check
-    if (file.isEmpty())
-        return ERR_INVALID_PARAMETER;
-
-    if ((UINT32)file.size() < sizeof(EFI_FFS_FILE_HEADER))
-        return ERR_INVALID_FILE;
-
-    // Get parent's parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
-    // Get file header
-    QByteArray header = file.left(sizeof(EFI_FFS_FILE_HEADER));
-    const EFI_FFS_FILE_HEADER* fileHeader = (const EFI_FFS_FILE_HEADER*)header.constData();
-    if (pdata.ffsVersion == 3 && (fileHeader->Attributes & FFS_ATTRIB_LARGE_FILE)) {
-        if ((UINT32)file.size() < sizeof(EFI_FFS_FILE_HEADER2))
-            return ERR_INVALID_FILE;
-        header = file.left(sizeof(EFI_FFS_FILE_HEADER2));
+    if (file.isEmpty()) {
+        return U_INVALID_PARAMETER;
     }
-
+    if ((UINT32)file.size() < sizeof(EFI_FFS_FILE_HEADER)) {
+        return U_INVALID_FILE;
+    }
+    
+    // Obtain required information from parent volume
+    UINT8 ffsVersion = 2;
+    bool isWeakAligned = false;
+    UINT32 volumeAlignment = 0xFFFFFFFF;
+    UINT8 volumeRevision = 2;
+    UModelIndex parentVolumeIndex = model->type(parent) == Types::Volume ? parent : model->findParentOfType(parent, Types::Volume);
+    if (parentVolumeIndex.isValid() && model->hasEmptyParsingData(parentVolumeIndex) == false) {
+        UByteArray data = model->parsingData(parentVolumeIndex);
+        const VOLUME_PARSING_DATA* pdata = (const VOLUME_PARSING_DATA*)data.constData();
+        ffsVersion = pdata->ffsVersion;
+        volumeAlignment = pdata->alignment;
+        volumeRevision = pdata->revision;
+        isWeakAligned = pdata->isWeakAligned;
+    }
+    
+    // Get file header
+    UByteArray header = file.left(sizeof(EFI_FFS_FILE_HEADER));
+    EFI_FFS_FILE_HEADER* tempFileHeader = (EFI_FFS_FILE_HEADER*)header.data();
+    if (tempFileHeader->Attributes & FFS_ATTRIB_LARGE_FILE) {
+        if (ffsVersion == 2 && volumeRevision == 2) {
+            if ((UINT32)file.size() < sizeof(EFI_FFS_FILE_HEADER2_LENOVO))
+                return U_INVALID_FILE;
+            header = file.left(sizeof(EFI_FFS_FILE_HEADER2_LENOVO));
+        }
+        if (ffsVersion == 3) {
+            if ((UINT32)file.size() < sizeof(EFI_FFS_FILE_HEADER2))
+                return U_INVALID_FILE;
+            header = file.left(sizeof(EFI_FFS_FILE_HEADER2));
+        }
+    }
+    const EFI_FFS_FILE_HEADER* fileHeader = (const EFI_FFS_FILE_HEADER*)header.constData();
+    
     // Check file alignment
     bool msgUnalignedFile = false;
     UINT8 alignmentPower = ffsAlignmentTable[(fileHeader->Attributes & FFS_ATTRIB_DATA_ALIGNMENT) >> 3];
-    UINT32 alignment = (UINT32)pow(2.0, alignmentPower);
-    if ((parentOffset + header.size()) % alignment)
+    if (volumeRevision > 1 && (fileHeader->Attributes & FFS_ATTRIB_DATA_ALIGNMENT2)) {
+        alignmentPower = ffsAlignment2Table[(fileHeader->Attributes & FFS_ATTRIB_DATA_ALIGNMENT) >> 3];
+    }
+    
+    UINT32 alignment = (UINT32)(1UL << alignmentPower);
+    if ((localOffset + header.size()) % alignment) {
         msgUnalignedFile = true;
-
-    // Check file alignment agains volume alignment
-    bool msgFileAlignmentIsGreaterThanVolumes = false;
-    if (!pdata.volume.isWeakAligned && pdata.volume.alignment < alignment)
-        msgFileAlignmentIsGreaterThanVolumes = true;
-
+    }
+    
+    // Check file alignment against volume alignment
+    bool msgFileAlignmentIsGreaterThanVolumeAlignment = false;
+    if (!isWeakAligned && volumeAlignment < alignment) {
+        msgFileAlignmentIsGreaterThanVolumeAlignment = true;
+    }
+    
+    // Get file body
+    UByteArray body;
+    // Zero-body-sized files are OK per UEFI PI spec
+    if (file.size() > header.size()) {
+        body = file.mid(header.size());
+    }
+    
+    // Check for file tail presence
+    UByteArray tail;
+    bool msgInvalidTailValue = false;
+    bool msgTailedFileTooSmall = false;
+    if (volumeRevision == 1 && (fileHeader->Attributes & FFS_ATTRIB_TAIL_PRESENT)) {
+        // Check if the file actually has at least 2 bytes of body
+        if (body.size() < sizeof(UINT16)) {
+            msgTailedFileTooSmall = true;
+        }
+        else {
+            // Check file tail;
+            UINT16 tailValue = *(UINT16*)body.right(sizeof(UINT16)).constData();
+            if (fileHeader->IntegrityCheck.TailReference != (UINT16)~tailValue)
+                msgInvalidTailValue = true;
+            
+            // Get tail and remove it from file body
+            tail = body.right(sizeof(UINT16));
+            body = body.left(body.size() - sizeof(UINT16));
+        }
+    }
+    
     // Check header checksum
-    QByteArray tempHeader = header;
-    EFI_FFS_FILE_HEADER* tempFileHeader = (EFI_FFS_FILE_HEADER*)(tempHeader.data());
-    tempFileHeader->IntegrityCheck.Checksum.Header = 0;
-    tempFileHeader->IntegrityCheck.Checksum.File = 0;
-    UINT8 calculatedHeader = calculateChecksum8((const UINT8*)tempFileHeader, header.size() - 1);
+    UINT8 calculatedHeader = 0x100 - (calculateSum8((const UINT8*)header.constData(), (UINT32)header.size()) - fileHeader->IntegrityCheck.Checksum.Header - fileHeader->IntegrityCheck.Checksum.File - fileHeader->State);
     bool msgInvalidHeaderChecksum = false;
-    if (fileHeader->IntegrityCheck.Checksum.Header != calculatedHeader)
+    if (fileHeader->IntegrityCheck.Checksum.Header != calculatedHeader) {
         msgInvalidHeaderChecksum = true;
-
+    }
+    
     // Check data checksum
     // Data checksum must be calculated
     bool msgInvalidDataChecksum = false;
+    bool msgDataChecksumForEmptyFile = false;
     UINT8 calculatedData = 0;
     if (fileHeader->Attributes & FFS_ATTRIB_CHECKSUM) {
-        UINT32 bufferSize = file.size() - header.size();
-        // Exclude file tail from data checksum calculation
-        if (pdata.volume.revision == 1 && (fileHeader->Attributes & FFS_ATTRIB_TAIL_PRESENT))
-            bufferSize -= sizeof(UINT16);
-        calculatedData = calculateChecksum8((const UINT8*)(file.constData() + header.size()), bufferSize);
-        if (fileHeader->IntegrityCheck.Checksum.File != calculatedData)
-            msgInvalidDataChecksum = true;
+        if (body.size() == 0) msgDataChecksumForEmptyFile = true;
+        else calculatedData = calculateChecksum8((const UINT8*)body.constData(), (UINT32)body.size());
     }
     // Data checksum must be one of predefined values
-    else if (pdata.volume.revision == 1 && fileHeader->IntegrityCheck.Checksum.File != FFS_FIXED_CHECKSUM) {
+    else if (volumeRevision == 1) {
         calculatedData = FFS_FIXED_CHECKSUM;
-        msgInvalidDataChecksum = true;
     }
-    else if (pdata.volume.revision == 2 && fileHeader->IntegrityCheck.Checksum.File != FFS_FIXED_CHECKSUM2) {
+    else {
         calculatedData = FFS_FIXED_CHECKSUM2;
+    }
+    
+    if (body.size() > 0 && fileHeader->IntegrityCheck.Checksum.File != calculatedData) {
         msgInvalidDataChecksum = true;
     }
-
+    
     // Check file type
     bool msgUnknownType = false;
-    if (fileHeader->Type > EFI_FV_FILETYPE_SMM_CORE && fileHeader->Type != EFI_FV_FILETYPE_PAD) {
+    if (fileHeader->Type > EFI_FV_FILETYPE_MM_CORE_STANDALONE && fileHeader->Type != EFI_FV_FILETYPE_PAD) {
         msgUnknownType = true;
     };
-
-    // Get file body
-    QByteArray body = file.mid(header.size());
-
-    // Check for file tail presence
-    QByteArray tail;
-    bool msgInvalidTailValue = false;
-    if (pdata.volume.revision == 1 && (fileHeader->Attributes & FFS_ATTRIB_TAIL_PRESENT))
-    {
-        //Check file tail;
-        UINT16 tailValue = *(UINT16*)body.right(sizeof(UINT16)).constData();
-        if (fileHeader->IntegrityCheck.TailReference != (UINT16)~tailValue)
-            msgInvalidTailValue = true;
-
-        // Get tail and remove it from file body
-        tail = body.right(sizeof(UINT16));
-        body = body.left(body.size() - sizeof(UINT16));
-    }
-
+    
     // Get info
-    QString name;
-    QString info;
-    if (fileHeader->Type != EFI_FV_FILETYPE_PAD)
-        name = guidToQString(fileHeader->Name);
-    else
-        name = QObject::tr("Pad-file");
-
-    info = QObject::tr("File GUID: %1\nType: %2h\nAttributes: %3h\nFull size: %4h (%5)\nHeader size: %6h (%7)\nBody size: %8h (%9)\nTail size: %10h (%11)\n"
-                       "State: %12h\nHeader checksum: %13h, %14\nData checksum: %15h, %16")
-        .arg(guidToQString(fileHeader->Name))
-        .hexarg2(fileHeader->Type, 2)
-        .hexarg2(fileHeader->Attributes, 2)
-        .hexarg(header.size() + body.size() + tail.size()).arg(header.size() + body.size() + tail.size())
-        .hexarg(header.size()).arg(header.size())
-        .hexarg(body.size()).arg(body.size())
-        .hexarg(tail.size()).arg(tail.size())
-        .hexarg2(fileHeader->State, 2)
-        .hexarg2(fileHeader->IntegrityCheck.Checksum.Header, 2)
-        .arg(msgInvalidHeaderChecksum ? QObject::tr("invalid, should be %1h").hexarg2(calculatedHeader, 2) : QObject::tr("valid"))
-        .hexarg2(fileHeader->IntegrityCheck.Checksum.File, 2)
-        .arg(msgInvalidDataChecksum ? QObject::tr("invalid, should be %1h").hexarg2(calculatedData, 2) : QObject::tr("valid"));
-
-    // Add file GUID to parsing data
-    pdata.file.guid = fileHeader->Name;
-
-    QString text;
+    UString name;
+    if (fileHeader->Type != EFI_FV_FILETYPE_PAD) {
+        name = guidToUString(fileHeader->Name);
+    } else {
+        name = UString("Padding file");
+    }
+    
+    UString info = UString("File GUID: ") + guidToUString(fileHeader->Name, false) +
+    usprintf("\nType: %02Xh\nAttributes: %02Xh\nState: %02Xh",
+             fileHeader->Type,
+             fileHeader->Attributes,
+             fileHeader->State) +
+    usprintf("\nHeader checksum: %02Xh", fileHeader->IntegrityCheck.Checksum.Header) + (msgInvalidHeaderChecksum ? usprintf(", invalid, should be %02Xh", calculatedHeader) : UString(", valid")) +
+    usprintf("\nData checksum: %02Xh", fileHeader->IntegrityCheck.Checksum.File) + (msgInvalidDataChecksum ? usprintf(", invalid, should be %02Xh", calculatedData) : UString(", valid"));
+    
+    UString text;
     bool isVtf = false;
+    bool isDxeCore = false;
     // Check if the file is a Volume Top File
-    if (QByteArray((const char*)&fileHeader->Name, sizeof(EFI_GUID)) == EFI_FFS_VOLUME_TOP_FILE_GUID) {
+    UByteArray fileGuid = UByteArray((const char*)&fileHeader->Name, sizeof(EFI_GUID));
+    if (fileGuid == EFI_FFS_VOLUME_TOP_FILE_GUID) {
         // Mark it as the last VTF
         // This information will later be used to determine memory addresses of uncompressed image elements
-        // Because the last byte of the last VFT is mapped to 0xFFFFFFFF physical memory address 
+        // Because the last byte of the last VFT is mapped to 0xFFFFFFFF physical memory address
         isVtf = true;
-        text = QObject::tr("Volume Top File");
+        text = UString("Volume Top File");
     }
-
-    // Construct parsing data
-    bool fixed = fileHeader->Attributes & FFS_ATTRIB_FIXED;
-    pdata.offset += parentOffset;
+    // Check if the file is the first DXE Core
+    else if (fileGuid == EFI_DXE_CORE_GUID || fileGuid == AMI_CORE_DXE_GUID) {
+        // Mark is as first DXE core
+        // This information may be used to determine DXE volume offset for old AMI or post-IBB protected ranges
+        isDxeCore = true;
+    }
     
-
+    // Construct fixed state
+    ItemFixedState fixed = (ItemFixedState)((fileHeader->Attributes & FFS_ATTRIB_FIXED) != 0);
+    
     // Add tree item
-    index = model->addItem(Types::File, fileHeader->Type, name, text, info, header, body, tail, fixed, parsingDataToQByteArray(pdata), parent);
-
-    // Overwrite lastVtf, if needed
+    index = model->addItem(localOffset, Types::File, fileHeader->Type, name, text, info, header, body, tail, fixed, parent);
+    
+    // Set parsing data for created file
+    FILE_PARSING_DATA pdata = {};
+    pdata.emptyByte = (fileHeader->State & EFI_FILE_ERASE_POLARITY) ? 0xFF : 0x00;
+    pdata.guid = fileHeader->Name;
+    model->setParsingData(index, UByteArray((const char*)&pdata, sizeof(pdata)));
+    
+    // Override lastVtf index, if needed
     if (isVtf) {
         lastVtf = index;
     }
-
+    
+    // Override first DXE core index, if needed
+    if (isDxeCore && !dxeCore.isValid()) {
+        dxeCore = index;
+    }
+    
     // Show messages
     if (msgUnalignedFile)
-        msg(QObject::tr("parseFileHeader: unaligned file"), index);
-    if (msgFileAlignmentIsGreaterThanVolumes)
-        msg(QObject::tr("parseFileHeader: file alignment %1h is greater than parent volume alignment %2h").hexarg(alignment).hexarg(pdata.volume.alignment), index);
+        msg(usprintf("%s: unaligned file", __FUNCTION__), index);
+    if (msgFileAlignmentIsGreaterThanVolumeAlignment)
+        msg(usprintf("%s: file alignment %Xh is greater than parent volume alignment %Xh", __FUNCTION__, alignment, volumeAlignment), index);
     if (msgInvalidHeaderChecksum)
-        msg(QObject::tr("parseFileHeader: invalid header checksum"), index);
+        msg(usprintf("%s: invalid header checksum %02Xh, should be %02Xh", __FUNCTION__, fileHeader->IntegrityCheck.Checksum.Header, calculatedHeader), index);
     if (msgInvalidDataChecksum)
-        msg(QObject::tr("parseFileHeader: invalid data checksum"), index);
+        msg(usprintf("%s: invalid data checksum %02Xh, should be %02Xh", __FUNCTION__, fileHeader->IntegrityCheck.Checksum.File, calculatedData), index);
     if (msgInvalidTailValue)
-        msg(QObject::tr("parseFileHeader: invalid tail value"), index);
+        msg(usprintf("%s: invalid tail value %04Xh", __FUNCTION__, *(const UINT16*)tail.constData()), index);
     if (msgUnknownType)
-        msg(QObject::tr("parseFileHeader: unknown file type %1h").hexarg2(fileHeader->Type, 2), index);
-
-    return ERR_SUCCESS;
+        msg(usprintf("%s: unknown file type %02Xh", __FUNCTION__, fileHeader->Type), index);
+    if (msgTailedFileTooSmall)
+        msg(usprintf("%s: tailed file too small", __FUNCTION__), index);
+    if(msgDataChecksumForEmptyFile)
+        msg(usprintf("%s: data checksum attribute set for empty file", __FUNCTION__), index);
+    
+    return U_SUCCESS;
 }
 
-UINT32 FfsParser::getSectionSize(const QByteArray & file, const UINT32 sectionOffset, const UINT8 ffsVersion)
+UINT32 FfsParser::getSectionSize(const UByteArray & file, const UINT32 sectionOffset, const UINT8 ffsVersion)
 {
+    if ((UINT32)file.size() < sectionOffset + sizeof(EFI_COMMON_SECTION_HEADER)) {
+        return 0;
+    }
+    const EFI_COMMON_SECTION_HEADER* sectionHeader = (const EFI_COMMON_SECTION_HEADER*)(file.constData() + sectionOffset);
+    
     if (ffsVersion == 2) {
-        if ((UINT32)file.size() < sectionOffset + sizeof(EFI_COMMON_SECTION_HEADER))
-            return 0;
-        const EFI_COMMON_SECTION_HEADER* sectionHeader = (const EFI_COMMON_SECTION_HEADER*)(file.constData() + sectionOffset);
         return uint24ToUint32(sectionHeader->Size);
     }
     else if (ffsVersion == 3) {
-        if ((UINT32)file.size() < sectionOffset + sizeof(EFI_COMMON_SECTION_HEADER2))
-            return 0;
-        const EFI_COMMON_SECTION_HEADER2* sectionHeader = (const EFI_COMMON_SECTION_HEADER2*)(file.constData() + sectionOffset);
         UINT32 size = uint24ToUint32(sectionHeader->Size);
-        if (size == EFI_SECTION2_IS_USED)
-            return sectionHeader->ExtendedSize;
-        else
-            return size;
+        if (size == EFI_SECTION2_IS_USED) {
+            if ((UINT32)file.size() < sectionOffset + sizeof(EFI_COMMON_SECTION_HEADER2)) {
+                return 0;
+            }
+            const EFI_COMMON_SECTION_HEADER2* sectionHeader2 = (const EFI_COMMON_SECTION_HEADER2*)(file.constData() + sectionOffset);
+            return sectionHeader2->ExtendedSize;
+        }
+        
+        return size;
     }
-    else
-        return 0;
+    
+    return 0;
 }
 
-STATUS FfsParser::parseFileBody(const QModelIndex & index)
+USTATUS FfsParser::parseFileBody(const UModelIndex & index)
 {
     // Sanity check
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
+        return U_INVALID_PARAMETER;
+    
     // Do not parse non-file bodies
     if (model->type(index) != Types::File)
-        return ERR_SUCCESS;
-
-    // Parse pad-file body
+        return U_SUCCESS;
+    
+    // Parse padding file body
     if (model->subtype(index) == EFI_FV_FILETYPE_PAD)
         return parsePadFileBody(index);
-
+    
     // Parse raw files as raw areas
     if (model->subtype(index) == EFI_FV_FILETYPE_RAW || model->subtype(index) == EFI_FV_FILETYPE_ALL) {
-        // Get data from parsing data
-        PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-
+        UByteArray fileGuid = UByteArray(model->header(index).constData(), sizeof(EFI_GUID));
+        
         // Parse NVAR store
-        if (QByteArray((const char*)&pdata.file.guid, sizeof(EFI_GUID)) == NVRAM_NVAR_STORE_FILE_GUID)
-            return parseNvarStore(index);
-
-        return parseRawArea(index);
+        if (fileGuid == NVRAM_NVAR_STORE_FILE_GUID) {
+            model->setText(index, UString("NVAR store"));
+            return nvramParser->parseNvarStore(index);
+        }
+        else if (fileGuid == NVRAM_NVAR_PEI_EXTERNAL_DEFAULTS_FILE_GUID) {
+            model->setText(index, UString("NVRAM external defaults"));
+            return nvramParser->parseNvarStore(index);
+        }
+        else if (fileGuid == NVRAM_NVAR_BB_DEFAULTS_FILE_GUID) {
+            model->setText(index, UString("NVAR BB defaults"));
+            return nvramParser->parseNvarStore(index);
+        }
+        // Parse vendor hash file
+        else if (fileGuid == PROTECTED_RANGE_VENDOR_HASH_FILE_GUID_PHOENIX) {
+            return parseVendorHashFile(fileGuid, index);
+        }
+        // Parse AMI ROM hole
+        else if (fileGuid == AMI_ROM_HOLE_FILE_GUID_0
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_1
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_2
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_3
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_4
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_5
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_6
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_7
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_8
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_9
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_10
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_11
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_12
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_13
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_14
+                 || fileGuid == AMI_ROM_HOLE_FILE_GUID_15) {
+            model->setText(index, UString("AMI ROM hole"));
+            // Mark ROM hole file as Fixed in the image
+            model->setFixed(index, Fixed);
+            // No need to parse further
+            return U_SUCCESS;
+        }
+        
+        if (parseSections(model->body(index), index, true) != U_SUCCESS) {
+            return parseRawArea(index);
+        }
     }
-
+    
     // Parse sections
     return parseSections(model->body(index), index);
 }
 
-STATUS FfsParser::parsePadFileBody(const QModelIndex & index)
+USTATUS FfsParser::parsePadFileBody(const UModelIndex & index)
 {
     // Sanity check
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
-    // Get data from parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-
+        return U_INVALID_PARAMETER;
+    
+    UByteArray body = model->body(index);
+    
     // Check if all bytes of the file are empty
-    QByteArray body = model->body(index);
-    if (body.size() == body.count(pdata.emptyByte))
-        return ERR_SUCCESS;
-
+    // Obtain required information from parent file
+    UINT8 emptyByte = 0xFF;
+    UModelIndex parentFileIndex = model->findParentOfType(index, Types::File);
+    if (parentFileIndex.isValid() && model->hasEmptyParsingData(parentFileIndex) == false) {
+        UByteArray data = model->parsingData(index);
+        const FILE_PARSING_DATA* pdata = (const FILE_PARSING_DATA*)data.constData();
+        emptyByte = pdata->emptyByte;
+    }
+    
+    // Check if the whole padding file is empty
+    if (isUniformByte(body, emptyByte))
+        return U_SUCCESS;
+    
     // Search for the first non-empty byte
-    UINT32 i;
-    UINT32 size = body.size();
+    UINT32 nonEmptyByteOffset;
+    UINT32 size = (UINT32)body.size();
     const UINT8* current = (const UINT8*)body.constData();
-    for (i = 0; i < size; i++) {
-        if (*current++ != pdata.emptyByte)
+    for (nonEmptyByteOffset = 0; nonEmptyByteOffset < size; nonEmptyByteOffset++) {
+        if (*current++ != emptyByte)
             break;
     }
-
+    
     // Add all bytes before as free space...
-    if (i >= 8) {
+    UINT32 headerSize = model->headerSize(index);
+    if (nonEmptyByteOffset >= 8) {
         // Align free space to 8 bytes boundary
-        if (i != ALIGN8(i))
-            i = ALIGN8(i) - 8;
-
-        QByteArray free = body.left(i);
-
-        // Get info
-        QString info = QObject::tr("Full size: %1h (%2)").hexarg(free.size()).arg(free.size());
-
-        // Constuct parsing data
-        pdata.offset += model->header(index).size();
-
+        if (nonEmptyByteOffset != ALIGN8(nonEmptyByteOffset))
+            nonEmptyByteOffset = ALIGN8(nonEmptyByteOffset) - 8;
+        
+        UByteArray free = body.left(nonEmptyByteOffset);
+        
         // Add tree item
-        model->addItem(Types::FreeSpace, 0, QObject::tr("Free space"), QString(), info, QByteArray(), free, QByteArray(), false, parsingDataToQByteArray(pdata), index);
-    }
-    else 
-        i = 0;
-
-    // ... and all bytes after as a padding
-    QByteArray padding = body.mid(i);
-
-    // Get info
-    QString info = QObject::tr("Full size: %1h (%2)").hexarg(padding.size()).arg(padding.size());
-
-    // Constuct parsing data
-    pdata.offset += i;
-
-    // Add tree item
-    QModelIndex dataIndex = model->addItem(Types::Padding, Subtypes::DataPadding, QObject::tr("Non-UEFI data"), "", info, QByteArray(), padding, QByteArray(), true, parsingDataToQByteArray(pdata), index);
-
-    // Show message
-    msg(QObject::tr("parsePadFileBody: non-UEFI data found in pad-file"), dataIndex);
-
-    // Rename the file
-    model->setName(index, QObject::tr("Non-empty pad-file"));
-
-    return ERR_SUCCESS;
-}
-
-STATUS FfsParser::parseSections(const QByteArray & sections, const QModelIndex & index, const bool preparse)
-{
-    // Sanity check
-    if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
-    // Get data from parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-
-    // Search for and parse all sections
-    UINT32 bodySize = sections.size();
-    UINT32 headerSize = model->header(index).size();
-    UINT32 sectionOffset = 0;
-
-    STATUS result = ERR_SUCCESS;
-    while (sectionOffset < bodySize) {
-        // Get section size
-        UINT32 sectionSize = getSectionSize(sections, sectionOffset, pdata.ffsVersion);
-
-        // Check section size
-        if (sectionSize < sizeof(EFI_COMMON_SECTION_HEADER) || sectionSize > (bodySize - sectionOffset)) {
-            // Add padding to fill the rest of sections
-            QByteArray padding = sections.mid(sectionOffset);
-            // Get info
-            QString info = QObject::tr("Full size: %1h (%2)").hexarg(padding.size()).arg(padding.size());
-
-            // Constuct parsing data
-            pdata.offset += headerSize + sectionOffset;
-
-            // Final parsing
-            if (!preparse) {
-                // Add tree item
-                QModelIndex dataIndex = model->addItem(Types::Padding, Subtypes::DataPadding, QObject::tr("Non-UEFI data"), "", info, QByteArray(), padding, QByteArray(), true, parsingDataToQByteArray(pdata), index);
-
-                // Show message
-                msg(QObject::tr("parseSections: non-UEFI data found in sections area"), dataIndex);
-            }
-            // Preparsing
-            else {
-                return ERR_INVALID_SECTION;
-            }
-            break; // Exit from parsing loop
-        }
-
-        // Parse section header
-        QModelIndex sectionIndex;
-        result = parseSectionHeader(sections.mid(sectionOffset, sectionSize), headerSize + sectionOffset, index, sectionIndex, preparse);
-        if (result) {
-            if (!preparse)
-                msg(QObject::tr("parseSections: section header parsing failed with error \"%1\"").arg(errorCodeToQString(result)), index);
-            else
-                return ERR_INVALID_SECTION;
-        }
-        // Move to next section
-        sectionOffset += sectionSize;
-        sectionOffset = ALIGN4(sectionOffset);
-    }
-
-    //Parse bodies, will be skipped on preparse phase
-    for (int i = 0; i < model->rowCount(index); i++) {
-        QModelIndex current = index.child(i, 0);
-        switch (model->type(current)) {
-        case Types::Section:
-            parseSectionBody(current);
-            break;
-        case Types::Padding:
-            // No parsing required
-            break;
-        default:
-            return ERR_UNKNOWN_ITEM_TYPE;
-        }
-    }
-    
-    return ERR_SUCCESS;
-}
-
-STATUS FfsParser::parseSectionHeader(const QByteArray & section, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index, const bool preparse)
-{
-    // Check sanity
-    if ((UINT32)section.size() < sizeof(EFI_COMMON_SECTION_HEADER))
-        return ERR_INVALID_SECTION;
-
-    const EFI_COMMON_SECTION_HEADER* sectionHeader = (const EFI_COMMON_SECTION_HEADER*)(section.constData());
-    switch (sectionHeader->Type) {
-    // Special
-    case EFI_SECTION_COMPRESSION:           return parseCompressedSectionHeader(section, parentOffset, parent, index, preparse);
-    case EFI_SECTION_GUID_DEFINED:          return parseGuidedSectionHeader(section, parentOffset, parent, index, preparse);
-    case EFI_SECTION_FREEFORM_SUBTYPE_GUID: return parseFreeformGuidedSectionHeader(section, parentOffset, parent, index, preparse);
-    case EFI_SECTION_VERSION:               return parseVersionSectionHeader(section, parentOffset, parent, index, preparse);
-    case PHOENIX_SECTION_POSTCODE:
-    case INSYDE_SECTION_POSTCODE:           return parsePostcodeSectionHeader(section, parentOffset, parent, index, preparse);
-    // Common
-    case EFI_SECTION_DISPOSABLE:
-    case EFI_SECTION_DXE_DEPEX:
-    case EFI_SECTION_PEI_DEPEX:
-    case EFI_SECTION_SMM_DEPEX:
-    case EFI_SECTION_PE32:
-    case EFI_SECTION_PIC:
-    case EFI_SECTION_TE:
-    case EFI_SECTION_COMPATIBILITY16:
-    case EFI_SECTION_USER_INTERFACE:
-    case EFI_SECTION_FIRMWARE_VOLUME_IMAGE:
-    case EFI_SECTION_RAW:                   return parseCommonSectionHeader(section, parentOffset, parent, index, preparse);
-    // Unknown
-    default: 
-        STATUS result = parseCommonSectionHeader(section, parentOffset, parent, index, preparse);
-        msg(QObject::tr("parseSectionHeader: section with unknown type %1h").hexarg2(sectionHeader->Type, 2), index);
-        return result;
-    }
-}
-
-STATUS FfsParser::parseCommonSectionHeader(const QByteArray & section, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index, const bool preparse)
-{
-    // Check sanity
-    if ((UINT32)section.size() < sizeof(EFI_COMMON_SECTION_HEADER))
-        return ERR_INVALID_SECTION;
-    
-    // Get data from parent's parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
-    // Obtain header fields
-    UINT32 headerSize;
-    UINT8  type;
-    const EFI_COMMON_SECTION_HEADER_APPLE* appleHeader = (const EFI_COMMON_SECTION_HEADER_APPLE*)(section.constData());
-    if ((UINT32)section.size() >= sizeof(EFI_COMMON_SECTION_HEADER_APPLE) && appleHeader->Reserved == EFI_SECTION_APPLE_USED) {
-        headerSize = sizeof(EFI_COMMON_SECTION_HEADER_APPLE);
-        type = appleHeader->Type;
+        model->addItem(headerSize, Types::FreeSpace, 0, UString("Free space"), UString(), UString(), UByteArray(), free, UByteArray(), Movable, index);
     }
     else {
-        const EFI_COMMON_SECTION_HEADER* sectionHeader = (const EFI_COMMON_SECTION_HEADER*)(section.constData());
-        headerSize = sizeof(EFI_COMMON_SECTION_HEADER);
-        if (pdata.ffsVersion == 3 && uint24ToUint32(sectionHeader->Size) == EFI_SECTION2_IS_USED)
-            headerSize = sizeof(EFI_COMMON_SECTION_HEADER2);
-        type = sectionHeader->Type;
+        nonEmptyByteOffset = 0;
     }
-
-    // Check sanity again
-    if ((UINT32)section.size() < headerSize)
-        return ERR_INVALID_SECTION;
     
-    QByteArray header = section.left(headerSize);
-    QByteArray body = section.mid(headerSize);
-
-    // Get info
-    QString name = sectionTypeToQString(type) + QObject::tr(" section");
-    QString info = QObject::tr("Type: %1h\nFull size: %2h (%3)\nHeader size: %4h (%5)\nBody size: %6h (%7)")
-        .hexarg2(type, 2)
-        .hexarg(section.size()).arg(section.size())
-        .hexarg(headerSize).arg(headerSize)
-        .hexarg(body.size()).arg(body.size());
-
-    // Construct parsing data
-    pdata.offset += parentOffset;
-
-    // Add tree item
-    if (!preparse) {
-        index = model->addItem(Types::Section, type, name, QString(), info, header, body, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-    } 
-    return ERR_SUCCESS;
+    // ... and all bytes after as a padding
+    UByteArray padding = body.mid(nonEmptyByteOffset);
+    
+    // Check for that data to be recovery startup AP data for x86
+    // https://github.com/tianocore/edk2/blob/stable/202011/BaseTools/Source/C/GenFv/GenFvInternalLib.c#L106
+    if (padding.left(RECOVERY_STARTUP_AP_DATA_X86_SIZE) == RECOVERY_STARTUP_AP_DATA_X86_128K) {
+        // Add tree item
+        (void)model->addItem(headerSize + nonEmptyByteOffset, Types::StartupApDataEntry, Subtypes::x86128kStartupApDataEntry, UString("Startup AP data"), UString(), UString(), UByteArray(), padding, UByteArray(), Fixed, index);
+        
+        // Rename the file
+        model->setName(index, UString("Startup AP data padding file"));
+        
+        // Do not parse contents
+        return U_SUCCESS;
+    }
+    else { // Not a data array
+        // Add tree item
+        UModelIndex dataIndex = model->addItem(headerSize + nonEmptyByteOffset, Types::Padding, Subtypes::DataPadding, UString("Non-UEFI data"), UString(), UString(), UByteArray(), padding, UByteArray(), Fixed, index);
+        
+        // Show message
+        msg(usprintf("%s: non-UEFI data found in padding file", __FUNCTION__), dataIndex);
+        
+        // Rename the file
+        model->setName(index, UString("Non-empty padding file"));
+        
+        // Do not parse contents
+        return U_SUCCESS;
+    }
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseCompressedSectionHeader(const QByteArray & section, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index, const bool preparse)
+USTATUS FfsParser::parseSections(const UByteArray & sections, const UModelIndex & index, const bool probe)
+{
+    // Sanity check
+    if (!index.isValid())
+        return U_INVALID_PARAMETER;
+    
+    // Search for and parse all sections
+    UINT32 fileBodySize = (UINT32)sections.size();
+    UINT32 fileHeaderSize = model->headerSize(index);
+    UINT32 sectionOffset = 0;
+    USTATUS result = U_SUCCESS;
+    
+    // Obtain required information from parent volume
+    UINT8 ffsVersion = 2;
+    UModelIndex parentVolumeIndex = model->findParentOfType(index, Types::Volume);
+    if (parentVolumeIndex.isValid() && model->hasEmptyParsingData(parentVolumeIndex) == false) {
+        UByteArray data = model->parsingData(parentVolumeIndex);
+        const VOLUME_PARSING_DATA* pdata = (const VOLUME_PARSING_DATA*)data.constData();
+        ffsVersion = pdata->ffsVersion;
+    }
+    
+    // Iterate over sections
+    UINT32 sectionSize = 0;
+    while (sectionOffset < fileBodySize) {
+        // Get section size
+        sectionSize = getSectionSize(sections, sectionOffset, ffsVersion);
+        
+        // Check section size to be sane
+        if (sectionSize < sizeof(EFI_COMMON_SECTION_HEADER)
+            || sectionSize > (fileBodySize - sectionOffset)) {
+            // Final parsing
+            if (!probe) {
+                // Add padding to fill the rest of sections
+                UByteArray padding = sections.mid(sectionOffset);
+
+                // Add tree item
+                UModelIndex dataIndex = model->addItem(fileHeaderSize + sectionOffset, Types::Padding, Subtypes::DataPadding, UString("Non-UEFI data"), UString(), UString(), UByteArray(), padding, UByteArray(), Fixed, index);
+                
+                // Show message
+                msg(usprintf("%s: non-UEFI data found in sections area", __FUNCTION__), dataIndex);
+                
+                // Exit from parsing loop
+                break;
+            }
+            // Preliminary parsing
+            else {
+                return U_INVALID_SECTION;
+            }
+        }
+        
+        // Parse section header
+        UModelIndex sectionIndex;
+        result = parseSectionHeader(sections.mid(sectionOffset, sectionSize), fileHeaderSize + sectionOffset, index, sectionIndex, probe);
+        if (result) {
+            if (!probe)
+                msg(usprintf("%s: section header parsing failed with error ", __FUNCTION__) + errorCodeToUString(result), index);
+            else
+                return U_INVALID_SECTION;
+        }
+        
+        // Move to next section
+        sectionOffset += sectionSize;
+    
+        if (!probe) {
+            // Check for alignment bytes after the current section
+            // Sections must be aligned to 4 bytes boundary inside the FFS file
+            // The alignment byte should be equal to 0x00 regardless of erasePolarity
+            UINT32 numAlignmentBytes = ALIGN4(sectionOffset) - sectionOffset;
+            
+            // We might be at the very end of the file, need a check for it
+            if (fileBodySize < sectionOffset + numAlignmentBytes) {
+                numAlignmentBytes = fileBodySize - sectionOffset;
+            }
+            
+            if (numAlignmentBytes > 0) {
+                UByteArray alignmentBytes = sections.mid(sectionOffset, numAlignmentBytes);
+                // Check alignment bytes to be sane
+                if (!isUniformByte(alignmentBytes, 0x00)) {
+                    msg(usprintf("%s: unexpected bytes found in section alignment area, should all be 0x00", __FUNCTION__), sectionIndex);
+                    
+                    // Add unexpected alignment bytes to tree item info
+                    UString info;
+                    for (UINT8 i = 0; i < numAlignmentBytes; i++) {
+                        info += usprintf("%02X ", alignmentBytes[i]);
+                    }
+                    model->addInfo(sectionIndex, UString("\nAlignment bytes: ") + info);
+                }
+                
+                // Store alignment bytes for upholding parsing pre/post-conditions (aka "every byte is accounted for")
+                model->setAlignmentBytes(sectionIndex, alignmentBytes);
+            }
+        }
+        
+        // Adjust sectionOffset
+        sectionOffset = ALIGN4(sectionOffset);
+    }
+    
+#if 0 // Do not enable this in production for now, as it needs further investigation.
+    // The PI spec requires sections to be aligned by 4 byte boundary with bytes that are all exactly zeroes
+    // Some images interpret "must be aligned by 4" as "every section needs to be padded for sectionSize to be divisible by 4".
+    // Detecting this case can be done by checking for the very last section to have sectionSize not divisible by 4, while the total bodySize is.
+    // However, such detection for a single file is unreliable because in 1/4 random cases the last section will be divisible by 4.
+    // We also know that either PEI core or DXE core is entity that does file and section parsing,
+    // so every single file in the volume should behave consistently.
+    // This makes the probability of unsuccessful detection here to be 1/(4^numFilesInVolume),
+    // which is low enough for real images out there.
+    // It should also be noted that enabling this section alignment quirk for an image that doesn't require it
+    // will not make the image unbootable, but will waste some space and possibly require to move some files around
+    if (sectionOffset == bodySize) {
+        // We are now at the very end of the file body, and sectionSize is the size of the last section
+        if ((sectionSize % 4 != 0) // sectionSize of the very last section is not divisible by 4
+            && (bodySize % 4 == 0)) { // yet bodySize is, meaning that there are indeed some padding bytes added after the last section
+            msg(usprintf("%s: section alignment quirk found", __FUNCTION__), index);
+        }
+    }
+#endif
+    
+    // Parse bodies, will be skipped if probing
+    for (int i = 0; i < model->rowCount(index); i++) {
+        UModelIndex current = index.model()->index(i, 0, index);
+        
+        switch (model->type(current)) {
+            case Types::Section:
+                parseSectionBody(current);
+                break;
+            case Types::Padding:
+                // No parsing required
+                break;
+            default:
+                return U_UNKNOWN_ITEM_TYPE;
+        }
+    }
+    
+    return U_SUCCESS;
+}
+
+USTATUS FfsParser::parseSectionHeader(const UByteArray & section, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index, const bool probe)
+{
+    // Check sanity
+    if ((UINT32)section.size() < sizeof(EFI_COMMON_SECTION_HEADER)) {
+        return U_INVALID_SECTION;
+    }
+    
+    const EFI_COMMON_SECTION_HEADER* sectionHeader = (const EFI_COMMON_SECTION_HEADER*)(section.constData());
+    switch (sectionHeader->Type) {
+        // Special
+        case EFI_SECTION_COMPRESSION:           return parseCompressedSectionHeader(section, localOffset, parent, index, probe);
+        case EFI_SECTION_GUID_DEFINED:          return parseGuidedSectionHeader(section, localOffset, parent, index, probe);
+        case EFI_SECTION_FREEFORM_SUBTYPE_GUID: return parseFreeformGuidedSectionHeader(section, localOffset, parent, index, probe);
+        case EFI_SECTION_VERSION:               return parseVersionSectionHeader(section, localOffset, parent, index, probe);
+        case PHOENIX_SECTION_POSTCODE:
+        case INSYDE_SECTION_POSTCODE:           return parsePostcodeSectionHeader(section, localOffset, parent, index, probe);
+        // Common
+        case EFI_SECTION_DISPOSABLE:
+        case EFI_SECTION_DXE_DEPEX:
+        case EFI_SECTION_PEI_DEPEX:
+        case EFI_SECTION_MM_DEPEX:
+        case EFI_SECTION_PE32:
+        case EFI_SECTION_PIC:
+        case EFI_SECTION_TE:
+        case EFI_SECTION_COMPATIBILITY16:
+        case EFI_SECTION_USER_INTERFACE:
+        case EFI_SECTION_FIRMWARE_VOLUME_IMAGE:
+        case EFI_SECTION_RAW:                   return parseCommonSectionHeader(section, localOffset, parent, index, probe);
+        // Unknown
+        default:
+            USTATUS result = parseCommonSectionHeader(section, localOffset, parent, index, probe);
+            if (!probe)
+                msg(usprintf("%s: section with unknown type %02Xh", __FUNCTION__, sectionHeader->Type), index);
+            return result;
+    }
+}
+
+USTATUS FfsParser::parseCommonSectionHeader(const UByteArray & section, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index, const bool probe)
+{
+    // Check sanity
+    if ((UINT32)section.size() < sizeof(EFI_COMMON_SECTION_HEADER)) {
+        return U_INVALID_SECTION;
+    }
+    
+    // Obtain required information from parent volume
+    UINT8 ffsVersion = 2;
+    UModelIndex parentVolumeIndex = model->findParentOfType(parent, Types::Volume);
+    if (parentVolumeIndex.isValid() && model->hasEmptyParsingData(parentVolumeIndex) == false) {
+        UByteArray data = model->parsingData(parentVolumeIndex);
+        const VOLUME_PARSING_DATA* pdata = (const VOLUME_PARSING_DATA*)data.constData();
+        ffsVersion = pdata->ffsVersion;
+    }
+    
+    // Obtain header fields
+    const EFI_COMMON_SECTION_HEADER* sectionHeader = (const EFI_COMMON_SECTION_HEADER*)(section.constData());
+    UINT32 headerSize = sizeof(EFI_COMMON_SECTION_HEADER);
+    if (ffsVersion == 3 && uint24ToUint32(sectionHeader->Size) == EFI_SECTION2_IS_USED)
+        headerSize = sizeof(EFI_COMMON_SECTION_HEADER2);
+    UINT8 type = sectionHeader->Type;
+    
+    // Check sanity again
+    if ((UINT32)section.size() < headerSize) {
+        return U_INVALID_SECTION;
+    }
+    
+    UByteArray header = section.left(headerSize);
+    UByteArray body = section.mid(headerSize);
+    
+    // Get info
+    UString name = sectionTypeToUString(type) + UString(" section");
+    UString info = usprintf("Type: %02Xh", type);
+    
+    // Add tree item
+    if (!probe) {
+        index = model->addItem(localOffset, Types::Section, type, name, UString(), info, header, body, UByteArray(), Movable, parent);
+    }
+    
+    return U_SUCCESS;
+}
+
+USTATUS FfsParser::parseCompressedSectionHeader(const UByteArray & section, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index, const bool probe)
 {
     // Check sanity
     if ((UINT32)section.size() < sizeof(EFI_COMMON_SECTION_HEADER))
-        return ERR_INVALID_SECTION;
-
-    // Get data from parent's parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
+        return U_INVALID_SECTION;
+    
+    // Obtain required information from parent volume
+    UINT8 ffsVersion = 2;
+    UModelIndex parentVolumeIndex = model->findParentOfType(parent, Types::Volume);
+    if (parentVolumeIndex.isValid() && model->hasEmptyParsingData(parentVolumeIndex) == false) {
+        UByteArray data = model->parsingData(parentVolumeIndex);
+        const VOLUME_PARSING_DATA* pdata = (const VOLUME_PARSING_DATA*)data.constData();
+        ffsVersion = pdata->ffsVersion;
+    }
+    
     // Obtain header fields
     UINT32 headerSize;
     UINT8 compressionType;
     UINT32 uncompressedLength;
     const EFI_COMMON_SECTION_HEADER* sectionHeader = (const EFI_COMMON_SECTION_HEADER*)(section.constData());
     const EFI_COMMON_SECTION_HEADER2* section2Header = (const EFI_COMMON_SECTION_HEADER2*)(section.constData());
-    const EFI_COMMON_SECTION_HEADER_APPLE* appleHeader = (const EFI_COMMON_SECTION_HEADER_APPLE*)(section.constData());
-       
-    if ((UINT32)section.size() >= sizeof(EFI_COMMON_SECTION_HEADER_APPLE) && appleHeader->Reserved == EFI_SECTION_APPLE_USED) { // Check for apple section
-        const EFI_COMPRESSION_SECTION_APPLE* appleSectionHeader = (const EFI_COMPRESSION_SECTION_APPLE*)(appleHeader + 1);
-        headerSize = sizeof(EFI_COMMON_SECTION_HEADER_APPLE) + sizeof(EFI_COMPRESSION_SECTION_APPLE);
-        compressionType = (UINT8)appleSectionHeader->CompressionType;
-        uncompressedLength = appleSectionHeader->UncompressedLength;
-    }
-    else if (pdata.ffsVersion == 3 && uint24ToUint32(sectionHeader->Size) == EFI_SECTION2_IS_USED) { // Check for extended header section
+    
+    if (ffsVersion == 3 && uint24ToUint32(sectionHeader->Size) == EFI_SECTION2_IS_USED) { // Check for extended header section
         const EFI_COMPRESSION_SECTION* compressedSectionHeader = (const EFI_COMPRESSION_SECTION*)(section2Header + 1);
         if ((UINT32)section.size() < sizeof(EFI_COMMON_SECTION_HEADER2) + sizeof(EFI_COMPRESSION_SECTION))
-            return ERR_INVALID_SECTION;
+            return U_INVALID_SECTION;
         headerSize = sizeof(EFI_COMMON_SECTION_HEADER2) + sizeof(EFI_COMPRESSION_SECTION);
         compressionType = compressedSectionHeader->CompressionType;
         uncompressedLength = compressedSectionHeader->UncompressedLength;
@@ -1952,45 +2781,51 @@ STATUS FfsParser::parseCompressedSectionHeader(const QByteArray & section, const
         compressionType = compressedSectionHeader->CompressionType;
         uncompressedLength = compressedSectionHeader->UncompressedLength;
     }
-
-    // Check sanity again
-    if ((UINT32)section.size() < headerSize)
-        return ERR_INVALID_SECTION;
     
-    QByteArray header = section.left(headerSize);
-    QByteArray body = section.mid(headerSize);
-
-    // Get info
-    QString name = sectionTypeToQString(sectionHeader->Type) + QObject::tr(" section");
-    QString info = QObject::tr("Type: %1h\nFull size: %2h (%3)\nHeader size: %4h (%5)\nBody size: %6h (%7)\nCompression type: %8h\nDecompressed size: %9h (%10)")
-        .hexarg2(sectionHeader->Type, 2)
-        .hexarg(section.size()).arg(section.size())
-        .hexarg(headerSize).arg(headerSize)
-        .hexarg(body.size()).arg(body.size())
-        .hexarg2(compressionType, 2)
-        .hexarg(uncompressedLength).arg(uncompressedLength);
-
-    // Construct parsing data
-    pdata.offset += parentOffset;
-    pdata.section.compressed.compressionType = compressionType;
-    pdata.section.compressed.uncompressedSize = uncompressedLength;
-
-    // Add tree item
-    if (!preparse) {
-        index = model->addItem(Types::Section, sectionHeader->Type, name, QString(), info, header, body, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
+    // Check sanity again
+    if ((UINT32)section.size() < headerSize) {
+        return U_INVALID_SECTION;
     }
-    return ERR_SUCCESS;
+    
+    UByteArray header = section.left(headerSize);
+    UByteArray body = section.mid(headerSize);
+    
+    // Get info
+    UString name = sectionTypeToUString(sectionHeader->Type) + UString(" section");
+    UString info = usprintf("Type: %02Xh\nCompression type: %02Xh\nDecompressed size: %Xh (%u)",
+                            sectionHeader->Type,
+                            compressionType,
+                            uncompressedLength, uncompressedLength);
+    
+    // Add tree item
+    if (!probe) {
+        index = model->addItem(localOffset, Types::Section, sectionHeader->Type, name, UString(), info, header, body, UByteArray(), Movable, parent);
+        
+        // Set section parsing data
+        COMPRESSED_SECTION_PARSING_DATA pdata = {};
+        pdata.compressionType = compressionType;
+        pdata.uncompressedSize = uncompressedLength;
+        model->setParsingData(index, UByteArray((const char*)&pdata, sizeof(pdata)));
+    }
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseGuidedSectionHeader(const QByteArray & section, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index, const bool preparse)
+USTATUS FfsParser::parseGuidedSectionHeader(const UByteArray & section, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index, const bool probe)
 {
     // Check sanity
     if ((UINT32)section.size() < sizeof(EFI_COMMON_SECTION_HEADER))
-        return ERR_INVALID_SECTION;
-
-    // Get data from parent's parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
+        return U_INVALID_SECTION;
+    
+    // Obtain required information from parent volume
+    UINT8 ffsVersion = 2;
+    UModelIndex parentVolumeIndex = model->findParentOfType(parent, Types::Volume);
+    if (parentVolumeIndex.isValid() && model->hasEmptyParsingData(parentVolumeIndex) == false) {
+        UByteArray data = model->parsingData(parentVolumeIndex);
+        const VOLUME_PARSING_DATA* pdata = (const VOLUME_PARSING_DATA*)data.constData();
+        ffsVersion = pdata->ffsVersion;
+    }
+    
     // Obtain header fields
     UINT32 headerSize;
     EFI_GUID guid;
@@ -1998,21 +2833,11 @@ STATUS FfsParser::parseGuidedSectionHeader(const QByteArray & section, const UIN
     UINT16 attributes;
     const EFI_COMMON_SECTION_HEADER* sectionHeader = (const EFI_COMMON_SECTION_HEADER*)(section.constData());
     const EFI_COMMON_SECTION_HEADER2* section2Header = (const EFI_COMMON_SECTION_HEADER2*)(section.constData());
-    const EFI_COMMON_SECTION_HEADER_APPLE* appleHeader = (const EFI_COMMON_SECTION_HEADER_APPLE*)(section.constData());
-
-    if ((UINT32)section.size() >= sizeof(EFI_COMMON_SECTION_HEADER_APPLE) && appleHeader->Reserved == EFI_SECTION_APPLE_USED) { // Check for apple section
-        const EFI_GUID_DEFINED_SECTION_APPLE* appleSectionHeader = (const EFI_GUID_DEFINED_SECTION_APPLE*)(appleHeader + 1);
-        headerSize = sizeof(EFI_COMMON_SECTION_HEADER_APPLE) + sizeof(EFI_GUID_DEFINED_SECTION_APPLE);
-        if ((UINT32)section.size() < headerSize)
-            return ERR_INVALID_SECTION;
-        guid = appleSectionHeader->SectionDefinitionGuid;
-        dataOffset = appleSectionHeader->DataOffset;
-        attributes = appleSectionHeader->Attributes;
-    }
-    else if (pdata.ffsVersion == 3 && uint24ToUint32(sectionHeader->Size) == EFI_SECTION2_IS_USED) { // Check for extended header section
+    
+    if (ffsVersion == 3 && uint24ToUint32(sectionHeader->Size) == EFI_SECTION2_IS_USED) { // Check for extended header section
         const EFI_GUID_DEFINED_SECTION* guidDefinedSectionHeader = (const EFI_GUID_DEFINED_SECTION*)(section2Header + 1);
         if ((UINT32)section.size() < sizeof(EFI_COMMON_SECTION_HEADER2) + sizeof(EFI_GUID_DEFINED_SECTION))
-            return ERR_INVALID_SECTION;
+            return U_INVALID_SECTION;
         headerSize = sizeof(EFI_COMMON_SECTION_HEADER2) + sizeof(EFI_GUID_DEFINED_SECTION);
         guid = guidDefinedSectionHeader->SectionDefinitionGuid;
         dataOffset = guidDefinedSectionHeader->DataOffset;
@@ -2020,18 +2845,21 @@ STATUS FfsParser::parseGuidedSectionHeader(const QByteArray & section, const UIN
     }
     else { // Normal section
         const EFI_GUID_DEFINED_SECTION* guidDefinedSectionHeader = (const EFI_GUID_DEFINED_SECTION*)(sectionHeader + 1);
+        if ((UINT32)section.size() < sizeof(EFI_COMMON_SECTION_HEADER) + sizeof(EFI_GUID_DEFINED_SECTION))
+            return U_INVALID_SECTION;
         headerSize = sizeof(EFI_COMMON_SECTION_HEADER) + sizeof(EFI_GUID_DEFINED_SECTION);
         guid = guidDefinedSectionHeader->SectionDefinitionGuid;
         dataOffset = guidDefinedSectionHeader->DataOffset;
         attributes = guidDefinedSectionHeader->Attributes;
     }
-    // Check sanity again
-    if ((UINT32)section.size() < headerSize)
-        return ERR_INVALID_SECTION;
 
+    // Check sanity again
+    if ((UINT32)section.size() < headerSize || section.size() < dataOffset)
+        return U_INVALID_SECTION;
+    
     // Check for special GUIDed sections
-    QByteArray additionalInfo;
-    QByteArray baGuid((const char*)&guid, sizeof(EFI_GUID));
+    UString additionalInfo;
+    UByteArray baGuid((const char*)&guid, sizeof(EFI_GUID));
     bool msgSignedSectionFound = false;
     bool msgNoAuthStatusAttribute = false;
     bool msgNoProcessingRequiredAttributeCompressed = false;
@@ -2039,148 +2867,207 @@ STATUS FfsParser::parseGuidedSectionHeader(const QByteArray & section, const UIN
     bool msgInvalidCrc = false;
     bool msgUnknownCertType = false;
     bool msgUnknownCertSubtype = false;
+    bool msgProcessingRequiredAttributeOnUnknownGuidedSection = false;
+    bool msgInvalidCompressedSize = false;
     if (baGuid == EFI_GUIDED_SECTION_CRC32) {
         if ((attributes & EFI_GUIDED_SECTION_AUTH_STATUS_VALID) == 0) { // Check that AuthStatusValid attribute is set on compressed GUIDed sections
             msgNoAuthStatusAttribute = true;
         }
-
+        
         if ((UINT32)section.size() < headerSize + sizeof(UINT32))
-            return ERR_INVALID_SECTION;
-
+            return U_INVALID_SECTION;
+        
         UINT32 crc = *(UINT32*)(section.constData() + headerSize);
-        additionalInfo += QObject::tr("\nChecksum type: CRC32");
+        additionalInfo += UString("\nChecksum type: CRC32");
         // Calculate CRC32 of section data
-        UINT32 calculated = crc32(0, (const UINT8*)section.constData() + dataOffset, section.size() - dataOffset);
+        UINT32 calculated = (UINT32)crc32(0, (const UINT8*)section.constData() + dataOffset, (uInt)(section.size() - dataOffset));
         if (crc == calculated) {
-            additionalInfo += QObject::tr("\nChecksum: %1h, valid").hexarg2(crc, 8);
+            additionalInfo += usprintf("\nChecksum: %08Xh, valid", crc);
         }
         else {
-            additionalInfo += QObject::tr("\nChecksum: %1h, invalid, should be %2h").hexarg2(crc, 8).hexarg2(calculated, 8);
+            additionalInfo += usprintf("\nChecksum: %08Xh, invalid, should be %08Xh", crc, calculated);
             msgInvalidCrc = true;
         }
         // No need to change dataOffset here
     }
-    else if (baGuid == EFI_GUIDED_SECTION_LZMA || baGuid == EFI_GUIDED_SECTION_TIANO) {
+    else if (baGuid == EFI_GUIDED_SECTION_LZMA
+        || baGuid == EFI_GUIDED_SECTION_LZMA_HP
+        || baGuid == EFI_GUIDED_SECTION_LZMA_MS
+        || baGuid == EFI_GUIDED_SECTION_LZMAF86
+        || baGuid == EFI_GUIDED_SECTION_TIANO
+        || baGuid == EFI_GUIDED_SECTION_GZIP) {
         if ((attributes & EFI_GUIDED_SECTION_PROCESSING_REQUIRED) == 0) { // Check that ProcessingRequired attribute is set on compressed GUIDed sections
             msgNoProcessingRequiredAttributeCompressed = true;
         }
         // No need to change dataOffset here
     }
+    else if (baGuid == EFI_GUIDED_SECTION_ZLIB_AMD) {
+        if ((attributes & EFI_GUIDED_SECTION_PROCESSING_REQUIRED) == 0) { // Check that ProcessingRequired attribute is set on compressed GUIDed sections
+            msgNoProcessingRequiredAttributeCompressed = true;
+        }
+
+        if ((UINT32)section.size() < headerSize + sizeof(EFI_AMD_ZLIB_SECTION_HEADER))
+            return U_INVALID_SECTION;
+
+        const EFI_AMD_ZLIB_SECTION_HEADER* amdZlibSectionHeader = (const EFI_AMD_ZLIB_SECTION_HEADER*)(section.constData() + headerSize);
+
+        // Check the compressed size to be sane
+        if ((UINT32)section.size() != headerSize + sizeof(EFI_AMD_ZLIB_SECTION_HEADER) + amdZlibSectionHeader->CompressedSize) {
+            msgInvalidCompressedSize = true;
+        }
+
+        // Adjust dataOffset
+        dataOffset += sizeof(EFI_AMD_ZLIB_SECTION_HEADER);
+    }
+    else if (baGuid == EFI_GUIDED_SECTION_BROTLI)
+    {
+        if ((attributes & EFI_GUIDED_SECTION_PROCESSING_REQUIRED) == 0) { // Check that ProcessingRequired attribute is set on compressed GUIDed sections
+            msgNoProcessingRequiredAttributeCompressed = true;
+        }
+
+        if ((UINT32)section.size() < headerSize + sizeof(EFI_BROTLI_SECTION_HEADER))
+            return U_INVALID_SECTION;
+
+        // Adjust dataOffset
+        dataOffset += sizeof(EFI_BROTLI_SECTION_HEADER);
+    }
+    else if (baGuid == EFI_CERT_TYPE_RSA2048_SHA256_GUID) {
+        if ((attributes & EFI_GUIDED_SECTION_PROCESSING_REQUIRED) == 0) { // Check that ProcessingRequired attribute is set on signed GUIDed sections
+            msgNoProcessingRequiredAttributeSigned = true;
+        }
+        
+        // Get certificate type and length
+        if ((UINT32)section.size() < headerSize + sizeof(EFI_CERT_BLOCK_RSA2048_SHA256))
+            return U_INVALID_SECTION;
+        
+        // Adjust dataOffset
+        dataOffset += sizeof(EFI_CERT_BLOCK_RSA2048_SHA256);
+        additionalInfo += UString("\nCertificate type: RSA2048/SHA256");
+        msgSignedSectionFound = true;
+    }
     else if (baGuid == EFI_FIRMWARE_CONTENTS_SIGNED_GUID) {
         if ((attributes & EFI_GUIDED_SECTION_PROCESSING_REQUIRED) == 0) { // Check that ProcessingRequired attribute is set on signed GUIDed sections
             msgNoProcessingRequiredAttributeSigned = true;
         }
-
+        
         // Get certificate type and length
         if ((UINT32)section.size() < headerSize + sizeof(WIN_CERTIFICATE))
-            return ERR_INVALID_SECTION;
-
+            return U_INVALID_SECTION;
+        
         const WIN_CERTIFICATE* winCertificate = (const WIN_CERTIFICATE*)(section.constData() + headerSize);
         UINT32 certLength = winCertificate->Length;
         UINT16 certType = winCertificate->CertificateType;
-
+        
         // Adjust dataOffset
         dataOffset += certLength;
-
+        
         // Check section size once again
         if ((UINT32)section.size() < dataOffset)
-            return ERR_INVALID_SECTION;
-
+            return U_INVALID_SECTION;
+        
         // Check certificate type
         if (certType == WIN_CERT_TYPE_EFI_GUID) {
-            additionalInfo += QObject::tr("\nCertificate type: UEFI");
+            additionalInfo += UString("\nCertificate type: UEFI");
+            
+            // Sanity check
+            if ((UINT32)section.size() < headerSize + sizeof(WIN_CERTIFICATE_UEFI_GUID))
+                return U_INVALID_SECTION;
 
             // Get certificate GUID
             const WIN_CERTIFICATE_UEFI_GUID* winCertificateUefiGuid = (const WIN_CERTIFICATE_UEFI_GUID*)(section.constData() + headerSize);
-            QByteArray certTypeGuid((const char*)&winCertificateUefiGuid->CertType, sizeof(EFI_GUID));
-
+            UByteArray certTypeGuid((const char*)&winCertificateUefiGuid->CertType, sizeof(EFI_GUID));
+            
             if (certTypeGuid == EFI_CERT_TYPE_RSA2048_SHA256_GUID) {
-                additionalInfo += QObject::tr("\nCertificate subtype: RSA2048/SHA256");
+                additionalInfo += UString("\nCertificate subtype: RSA2048/SHA256");
             }
             else {
-                additionalInfo += QObject::tr("\nCertificate subtype: unknown, GUID %1").arg(guidToQString(winCertificateUefiGuid->CertType));
+                additionalInfo += UString("\nCertificate subtype: unknown, GUID ") + guidToUString(winCertificateUefiGuid->CertType);
                 msgUnknownCertSubtype = true;
             }
         }
         else {
-            additionalInfo += QObject::tr("\nCertificate type: unknown (%1h)").hexarg2(certType, 4);
+            additionalInfo += usprintf("\nCertificate type: unknown (%04Xh)", certType);
             msgUnknownCertType = true;
         }
         msgSignedSectionFound = true;
     }
-
-    QByteArray header = section.left(dataOffset);
-    QByteArray body = section.mid(dataOffset);
-
+    // Check that ProcessingRequired attribute is not set on GUIDed sections with unknown GUID
+    else if ((attributes & EFI_GUIDED_SECTION_PROCESSING_REQUIRED) == EFI_GUIDED_SECTION_PROCESSING_REQUIRED) {
+        msgProcessingRequiredAttributeOnUnknownGuidedSection = true;
+    }
+    
+    UByteArray header = section.left(dataOffset);
+    UByteArray body = section.mid(dataOffset);
+    
     // Get info
-    QString name = guidToQString(guid);
-    QString info = QObject::tr("Section GUID: %1\nType: %2h\nFull size: %3h (%4)\nHeader size: %5h (%6)\nBody size: %7h (%8)\nData offset: %9h\nAttributes: %10h")
-        .arg(name)
-        .hexarg2(sectionHeader->Type, 2)
-        .hexarg(section.size()).arg(section.size())
-        .hexarg(header.size()).arg(header.size())
-        .hexarg(body.size()).arg(body.size())
-        .hexarg(dataOffset)
-        .hexarg2(attributes, 4);
-
+    UString name = guidToUString(guid);
+    UString info = UString("Section GUID: ") + guidToUString(guid, false) +
+    usprintf("\nType: %02Xh\nAttributes: %04Xh",
+             sectionHeader->Type,
+             attributes);
+    
     // Append additional info
-    info.append(additionalInfo);
-
-    // Construct parsing data
-    pdata.offset += parentOffset;
-    pdata.section.guidDefined.guid = guid;
-
+    info += additionalInfo;
+    
     // Add tree item
-    if (!preparse) {
-        index = model->addItem(Types::Section, sectionHeader->Type, name, QString(), info, header, body, QByteArray(), false, parsingDataToQByteArray(pdata), parent);
-
+    if (!probe) {
+        index = model->addItem(localOffset, Types::Section, sectionHeader->Type, name, UString(), info, header, body, UByteArray(), Movable, parent);
+        
+        // Set parsing data
+        GUIDED_SECTION_PARSING_DATA pdata = {};
+        pdata.guid = guid;
+        model->setParsingData(index, UByteArray((const char*)&pdata, sizeof(pdata)));
+        
         // Show messages
         if (msgSignedSectionFound)
-            msg(QObject::tr("parseGuidedSectionHeader: section signature may become invalid after any modification"), index);
+            msg(usprintf("%s: GUIDed section signature may become invalid after modification", __FUNCTION__), index);
         if (msgNoAuthStatusAttribute)
-            msg(QObject::tr("parseGuidedSectionHeader: CRC32 GUIDed section without AuthStatusValid attribute"), index);
+            msg(usprintf("%s: CRC32 GUIDed section without AuthStatusValid attribute", __FUNCTION__), index);
         if (msgNoProcessingRequiredAttributeCompressed)
-            msg(QObject::tr("parseGuidedSectionHeader: compressed GUIDed section without ProcessingRequired attribute"), index);
+            msg(usprintf("%s: compressed GUIDed section without ProcessingRequired attribute", __FUNCTION__), index);
         if (msgNoProcessingRequiredAttributeSigned)
-            msg(QObject::tr("parseGuidedSectionHeader: signed GUIDed section without ProcessingRequired attribute"), index);
+            msg(usprintf("%s: signed GUIDed section without ProcessingRequired attribute", __FUNCTION__), index);
         if (msgInvalidCrc)
-            msg(QObject::tr("parseGuidedSectionHeader: GUID defined section with invalid CRC32"), index);
+            msg(usprintf("%s: CRC32 GUIDed section with invalid checksum", __FUNCTION__), index);
         if (msgUnknownCertType)
-            msg(QObject::tr("parseGuidedSectionHeader: signed GUIDed section with unknown type"), index);
+            msg(usprintf("%s: signed GUIDed section with unknown certificate type", __FUNCTION__), index);
         if (msgUnknownCertSubtype)
-            msg(QObject::tr("parseGuidedSectionHeader: signed GUIDed section with unknown subtype"), index);
+            msg(usprintf("%s: signed GUIDed section with unknown certificate subtype", __FUNCTION__), index);
+        if (msgProcessingRequiredAttributeOnUnknownGuidedSection)
+            msg(usprintf("%s: processing required bit set for GUIDed section with unknown GUID", __FUNCTION__), index);
+        if (msgInvalidCompressedSize)
+            msg(usprintf("%s: AMD Zlib-compressed section with invalid compressed size", __FUNCTION__), index);
     }
-
-    return ERR_SUCCESS;
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseFreeformGuidedSectionHeader(const QByteArray & section, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index, const bool preparse)
+USTATUS FfsParser::parseFreeformGuidedSectionHeader(const UByteArray & section, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index, const bool probe)
 {
     // Check sanity
-    if ((UINT32)section.size() < sizeof(EFI_COMMON_SECTION_HEADER))
-        return ERR_INVALID_SECTION;
-
-    // Get data from parent's parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
+    if ((UINT32)section.size() < sizeof(EFI_COMMON_SECTION_HEADER) + sizeof(EFI_FREEFORM_SUBTYPE_GUID_SECTION))
+        return U_INVALID_SECTION;
+    
+    // Obtain required information from parent volume
+    UINT8 ffsVersion = 2;
+    UModelIndex parentVolumeIndex = model->findParentOfType(parent, Types::Volume);
+    if (parentVolumeIndex.isValid() && model->hasEmptyParsingData(parentVolumeIndex) == false) {
+        UByteArray data = model->parsingData(parentVolumeIndex);
+        const VOLUME_PARSING_DATA* pdata = (const VOLUME_PARSING_DATA*)data.constData();
+        ffsVersion = pdata->ffsVersion;
+    }
+    
     // Obtain header fields
     UINT32 headerSize;
     EFI_GUID guid;
     UINT8 type;
     const EFI_COMMON_SECTION_HEADER* sectionHeader = (const EFI_COMMON_SECTION_HEADER*)(section.constData());
     const EFI_COMMON_SECTION_HEADER2* section2Header = (const EFI_COMMON_SECTION_HEADER2*)(section.constData());
-    const EFI_COMMON_SECTION_HEADER_APPLE* appleHeader = (const EFI_COMMON_SECTION_HEADER_APPLE*)(section.constData());
-
-    if ((UINT32)section.size() >= sizeof(EFI_COMMON_SECTION_HEADER_APPLE) && appleHeader->Reserved == EFI_SECTION_APPLE_USED) { // Check for apple section
-        const EFI_FREEFORM_SUBTYPE_GUID_SECTION* appleSectionHeader = (const EFI_FREEFORM_SUBTYPE_GUID_SECTION*)(appleHeader + 1);
-        headerSize = sizeof(EFI_COMMON_SECTION_HEADER_APPLE) + sizeof(EFI_FREEFORM_SUBTYPE_GUID_SECTION);
-        guid = appleSectionHeader->SubTypeGuid;
-        type = appleHeader->Type;
-    }
-    else if (pdata.ffsVersion == 3 && uint24ToUint32(sectionHeader->Size) == EFI_SECTION2_IS_USED) { // Check for extended header section
+    
+    if (ffsVersion == 3 && uint24ToUint32(sectionHeader->Size) == EFI_SECTION2_IS_USED) { // Check for extended header section
         const EFI_FREEFORM_SUBTYPE_GUID_SECTION* fsgSectionHeader = (const EFI_FREEFORM_SUBTYPE_GUID_SECTION*)(section2Header + 1);
         if ((UINT32)section.size() < sizeof(EFI_COMMON_SECTION_HEADER2) + sizeof(EFI_FREEFORM_SUBTYPE_GUID_SECTION))
-            return ERR_INVALID_SECTION;
+            return U_INVALID_SECTION;
         headerSize = sizeof(EFI_COMMON_SECTION_HEADER2) + sizeof(EFI_FREEFORM_SUBTYPE_GUID_SECTION);
         guid = fsgSectionHeader->SubTypeGuid;
         type = section2Header->Type;
@@ -2191,61 +3078,57 @@ STATUS FfsParser::parseFreeformGuidedSectionHeader(const QByteArray & section, c
         guid = fsgSectionHeader->SubTypeGuid;
         type = sectionHeader->Type;
     }
-
+    
     // Check sanity again
     if ((UINT32)section.size() < headerSize)
-        return ERR_INVALID_SECTION;
-
-    QByteArray header = section.left(headerSize);
-    QByteArray body = section.mid(headerSize);
-
+        return U_INVALID_SECTION;
+    
+    UByteArray header = section.left(headerSize);
+    UByteArray body = section.mid(headerSize);
+    
     // Get info
-    QString name = sectionTypeToQString(type) + QObject::tr(" section");
-    QString info = QObject::tr("Type: %1h\nFull size: %2h (%3)\nHeader size: %4h (%5)\nBody size: %6h (%7)\nSubtype GUID: %8")
-        .hexarg2(type, 2)
-        .hexarg(section.size()).arg(section.size())
-        .hexarg(header.size()).arg(header.size())
-        .hexarg(body.size()).arg(body.size())
-        .arg(guidToQString(guid));
-
-    // Construct parsing data
-    pdata.offset += parentOffset;
-    pdata.section.freeformSubtypeGuid.guid = guid;
-
+    UString name = sectionTypeToUString(type) + (" section");
+    UString info = usprintf("Type: %02Xh\nSubtype GUID: ", type) + guidToUString(guid, false);
+    
     // Add tree item
-    if (!preparse) {
-        index = model->addItem(Types::Section, type, name, QString(), info, header, body, QByteArray(), false, parsingDataToQByteArray(pdata), parent);
-
+    if (!probe) {
+        index = model->addItem(localOffset, Types::Section, type, name, UString(), info, header, body, UByteArray(), Movable, parent);
+        
+        // Set parsing data
+        FREEFORM_GUIDED_SECTION_PARSING_DATA pdata = {};
+        pdata.guid = guid;
+        model->setParsingData(index, UByteArray((const char*)&pdata, sizeof(pdata)));
+        
         // Rename section
-        model->setName(index, guidToQString(guid));
+        model->setName(index, guidToUString(guid));
     }
-    return ERR_SUCCESS;
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseVersionSectionHeader(const QByteArray & section, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index, const bool preparse)
+USTATUS FfsParser::parseVersionSectionHeader(const UByteArray & section, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index, const bool probe)
 {
     // Check sanity
     if ((UINT32)section.size() < sizeof(EFI_COMMON_SECTION_HEADER))
-        return ERR_INVALID_SECTION;
-
-    // Get data from parent's parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
+        return U_INVALID_SECTION;
+    
+    // Obtain required information from parent volume
+    UINT8 ffsVersion = 2;
+    UModelIndex parentVolumeIndex = model->findParentOfType(parent, Types::Volume);
+    if (parentVolumeIndex.isValid() && model->hasEmptyParsingData(parentVolumeIndex) == false) {
+        UByteArray data = model->parsingData(parentVolumeIndex);
+        const VOLUME_PARSING_DATA* pdata = (const VOLUME_PARSING_DATA*)data.constData();
+        ffsVersion = pdata->ffsVersion;
+    }
+    
     // Obtain header fields
     UINT32 headerSize;
     UINT16 buildNumber;
     UINT8 type;
     const EFI_COMMON_SECTION_HEADER* sectionHeader = (const EFI_COMMON_SECTION_HEADER*)(section.constData());
     const EFI_COMMON_SECTION_HEADER2* section2Header = (const EFI_COMMON_SECTION_HEADER2*)(section.constData());
-    const EFI_COMMON_SECTION_HEADER_APPLE* appleHeader = (const EFI_COMMON_SECTION_HEADER_APPLE*)(section.constData());
-
-    if ((UINT32)section.size() >= sizeof(EFI_COMMON_SECTION_HEADER_APPLE) && appleHeader->Reserved == EFI_SECTION_APPLE_USED) { // Check for apple section
-        const EFI_VERSION_SECTION* versionHeader = (const EFI_VERSION_SECTION*)(appleHeader + 1);
-        headerSize = sizeof(EFI_COMMON_SECTION_HEADER_APPLE) + sizeof(EFI_VERSION_SECTION);
-        buildNumber = versionHeader->BuildNumber;
-        type = appleHeader->Type;
-    }
-    else if (pdata.ffsVersion == 3 && uint24ToUint32(sectionHeader->Size) == EFI_SECTION2_IS_USED) { // Check for extended header section
+    
+    if (ffsVersion == 3 && uint24ToUint32(sectionHeader->Size) == EFI_SECTION2_IS_USED) { // Check for extended header section
         const EFI_VERSION_SECTION* versionHeader = (const EFI_VERSION_SECTION*)(section2Header + 1);
         headerSize = sizeof(EFI_COMMON_SECTION_HEADER2) + sizeof(EFI_VERSION_SECTION);
         buildNumber = versionHeader->BuildNumber;
@@ -2257,57 +3140,51 @@ STATUS FfsParser::parseVersionSectionHeader(const QByteArray & section, const UI
         buildNumber = versionHeader->BuildNumber;
         type = sectionHeader->Type;
     }
-
+    
     // Check sanity again
     if ((UINT32)section.size() < headerSize)
-        return ERR_INVALID_SECTION;
-
-    QByteArray header = section.left(headerSize);
-    QByteArray body = section.mid(headerSize);
+        return U_INVALID_SECTION;
+    
+    UByteArray header = section.left(headerSize);
+    UByteArray body = section.mid(headerSize);
     
     // Get info
-    QString name = sectionTypeToQString(type) + QObject::tr(" section");
-    QString info = QObject::tr("Type: %1h\nFull size: %2h (%3)\nHeader size: %4h (%5)\nBody size: %6h (%7)\nBuild number: %8")
-        .hexarg2(type, 2)
-        .hexarg(section.size()).arg(section.size())
-        .hexarg(header.size()).arg(header.size())
-        .hexarg(body.size()).arg(body.size())
-        .arg(buildNumber);
-
-    // Construct parsing data
-    pdata.offset += parentOffset;
-
+    UString name = sectionTypeToUString(type) + (" section");
+    UString info = usprintf("Type: %02Xh\nBuild number: %u",
+                            type,
+                            buildNumber);
+    
     // Add tree item
-    if (!preparse) {
-        index = model->addItem(Types::Section, type, name, QString(), info, header, body, QByteArray(), false, parsingDataToQByteArray(pdata), parent);
+    if (!probe) {
+        index = model->addItem(localOffset, Types::Section, type, name, UString(), info, header, body, UByteArray(), Movable, parent);
     }
-    return ERR_SUCCESS;
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parsePostcodeSectionHeader(const QByteArray & section, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index, const bool preparse)
+USTATUS FfsParser::parsePostcodeSectionHeader(const UByteArray & section, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index, const bool probe)
 {
     // Check sanity
     if ((UINT32)section.size() < sizeof(EFI_COMMON_SECTION_HEADER))
-        return ERR_INVALID_SECTION;
-
-    // Get data from parent's parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
+        return U_INVALID_SECTION;
+    
+    // Obtain required information from parent volume
+    UINT8 ffsVersion = 2;
+    UModelIndex parentVolumeIndex = model->findParentOfType(parent, Types::Volume);
+    if (parentVolumeIndex.isValid() && model->hasEmptyParsingData(parentVolumeIndex) == false) {
+        UByteArray data = model->parsingData(parentVolumeIndex);
+        const VOLUME_PARSING_DATA* pdata = (const VOLUME_PARSING_DATA*)data.constData();
+        ffsVersion = pdata->ffsVersion;
+    }
+    
     // Obtain header fields
     UINT32 headerSize;
     UINT32 postCode;
     UINT8 type;
     const EFI_COMMON_SECTION_HEADER* sectionHeader = (const EFI_COMMON_SECTION_HEADER*)(section.constData());
     const EFI_COMMON_SECTION_HEADER2* section2Header = (const EFI_COMMON_SECTION_HEADER2*)(section.constData());
-    const EFI_COMMON_SECTION_HEADER_APPLE* appleHeader = (const EFI_COMMON_SECTION_HEADER_APPLE*)(section.constData());
-
-    if ((UINT32)section.size() >= sizeof(EFI_COMMON_SECTION_HEADER_APPLE) && appleHeader->Reserved == EFI_SECTION_APPLE_USED) { // Check for apple section
-        const POSTCODE_SECTION* postcodeHeader = (const POSTCODE_SECTION*)(appleHeader + 1);
-        headerSize = sizeof(EFI_COMMON_SECTION_HEADER_APPLE) + sizeof(POSTCODE_SECTION);
-        postCode = postcodeHeader->Postcode;
-        type = appleHeader->Type;
-    }
-    else if (pdata.ffsVersion == 3 && uint24ToUint32(sectionHeader->Size) == EFI_SECTION2_IS_USED) { // Check for extended header section
+    
+    if (ffsVersion == 3 && uint24ToUint32(sectionHeader->Size) == EFI_SECTION2_IS_USED) { // Check for extended header section
         const POSTCODE_SECTION* postcodeHeader = (const POSTCODE_SECTION*)(section2Header + 1);
         headerSize = sizeof(EFI_COMMON_SECTION_HEADER2) + sizeof(POSTCODE_SECTION);
         postCode = postcodeHeader->Postcode;
@@ -2319,425 +3196,528 @@ STATUS FfsParser::parsePostcodeSectionHeader(const QByteArray & section, const U
         postCode = postcodeHeader->Postcode;
         type = sectionHeader->Type;
     }
-
+    
     // Check sanity again
     if ((UINT32)section.size() < headerSize)
-        return ERR_INVALID_SECTION;
-
-    QByteArray header = section.left(headerSize);
-    QByteArray body = section.mid(headerSize);
-
+        return U_INVALID_SECTION;
+    
+    UByteArray header = section.left(headerSize);
+    UByteArray body = section.mid(headerSize);
+    
     // Get info
-    QString name = sectionTypeToQString(type) + QObject::tr(" section");
-    QString info = QObject::tr("Type: %1h\nFull size: %2h (%3)\nHeader size: %4h (%5)\nBody size: %6h (%7)\nPostcode: %8h")
-        .hexarg2(type, 2)
-        .hexarg(section.size()).arg(section.size())
-        .hexarg(header.size()).arg(header.size())
-        .hexarg(body.size()).arg(body.size())
-        .hexarg(postCode);
-
-    // Construct parsing data
-    pdata.offset += parentOffset;
-
+    UString name = sectionTypeToUString(type) + (" section");
+    UString info = usprintf("Type: %02Xh\nPostcode: %Xh",
+                            type,
+                            postCode);
+    
     // Add tree item
-    if (!preparse) {
-        index = model->addItem(Types::Section, sectionHeader->Type, name, QString(), info, header, body, QByteArray(), false, parsingDataToQByteArray(pdata), parent);
+    if (!probe) {
+        index = model->addItem(localOffset, Types::Section, sectionHeader->Type, name, UString(), info, header, body, UByteArray(), Movable, parent);
     }
-    return ERR_SUCCESS;
+    
+    return U_SUCCESS;
 }
 
-
-STATUS FfsParser::parseSectionBody(const QModelIndex & index)
+USTATUS FfsParser::parseSectionBody(const UModelIndex & index)
 {
     // Sanity check
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-    QByteArray header = model->header(index);
+        return U_INVALID_PARAMETER;
+    UByteArray header = model->header(index);
     if ((UINT32)header.size() < sizeof(EFI_COMMON_SECTION_HEADER))
-        return ERR_INVALID_SECTION;
+        return U_INVALID_SECTION;
     
     const EFI_COMMON_SECTION_HEADER* sectionHeader = (const EFI_COMMON_SECTION_HEADER*)(header.constData());
-
+    
     switch (sectionHeader->Type) {
-    // Encapsulation
-    case EFI_SECTION_COMPRESSION:           return parseCompressedSectionBody(index);
-    case EFI_SECTION_GUID_DEFINED:          return parseGuidedSectionBody(index);
-    case EFI_SECTION_DISPOSABLE:            return parseSections(model->body(index), index);
-    // Leaf
-    case EFI_SECTION_FREEFORM_SUBTYPE_GUID: return parseRawArea(index);
-    case EFI_SECTION_VERSION:               return parseVersionSectionBody(index);
-    case EFI_SECTION_DXE_DEPEX:
-    case EFI_SECTION_PEI_DEPEX:
-    case EFI_SECTION_SMM_DEPEX:             return parseDepexSectionBody(index);
-    case EFI_SECTION_TE:                    return parseTeImageSectionBody(index);
-    case EFI_SECTION_PE32:
-    case EFI_SECTION_PIC:                   return parsePeImageSectionBody(index);
-    case EFI_SECTION_USER_INTERFACE:        return parseUiSectionBody(index);
-    case EFI_SECTION_FIRMWARE_VOLUME_IMAGE: return parseRawArea(index);
-    case EFI_SECTION_RAW:                   return parseRawSectionBody(index);
-    // No parsing needed
-    case EFI_SECTION_COMPATIBILITY16:
-    case PHOENIX_SECTION_POSTCODE:
-    case INSYDE_SECTION_POSTCODE:
-    default:
-        return ERR_SUCCESS;
+        // Encapsulation
+        case EFI_SECTION_COMPRESSION:           return parseCompressedSectionBody(index);
+        case EFI_SECTION_GUID_DEFINED:          return parseGuidedSectionBody(index);
+        case EFI_SECTION_DISPOSABLE:            return parseSections(model->body(index), index);
+        // Leaf
+        case EFI_SECTION_FREEFORM_SUBTYPE_GUID: return parseRawArea(index);
+        case EFI_SECTION_VERSION:               return parseVersionSectionBody(index);
+        case EFI_SECTION_DXE_DEPEX:
+        case EFI_SECTION_PEI_DEPEX:
+        case EFI_SECTION_MM_DEPEX:              return parseDepexSectionBody(index);
+        case EFI_SECTION_TE:                    return parseTeImageSectionBody(index);
+        case EFI_SECTION_PE32:
+        case EFI_SECTION_PIC:                   return parsePeImageSectionBody(index);
+        case EFI_SECTION_USER_INTERFACE:        return parseUiSectionBody(index);
+        case EFI_SECTION_FIRMWARE_VOLUME_IMAGE: return parseRawArea(index);
+        case EFI_SECTION_RAW:                   return parseRawSectionBody(index);
+        // No parsing needed
+        case EFI_SECTION_COMPATIBILITY16:
+        case PHOENIX_SECTION_POSTCODE:
+        case INSYDE_SECTION_POSTCODE:
+        default:
+            return U_SUCCESS;
     }
 }
 
-STATUS FfsParser::parseCompressedSectionBody(const QModelIndex & index)
+USTATUS FfsParser::parseCompressedSectionBody(const UModelIndex & index)
 {
     // Sanity check
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
-    // Get data from parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-    UINT8 algorithm = pdata.section.compressed.compressionType;
-
+        return U_INVALID_PARAMETER;
+    
+    // Obtain required information from parsing data
+    UINT8 compressionType = EFI_NOT_COMPRESSED;
+    UINT32 uncompressedSize = model->bodySize(index);
+    if (model->hasEmptyParsingData(index) == false) {
+        UByteArray data = model->parsingData(index);
+        const COMPRESSED_SECTION_PARSING_DATA* pdata = (const COMPRESSED_SECTION_PARSING_DATA*)data.constData();
+        compressionType = readUnaligned(pdata).compressionType;
+        uncompressedSize = readUnaligned(pdata).uncompressedSize;
+    }
+    
     // Decompress section
-    QByteArray decompressed;
-    QByteArray efiDecompressed;
-    STATUS result = decompress(model->body(index), algorithm, decompressed, efiDecompressed);
+    UINT8 algorithm = COMPRESSION_ALGORITHM_NONE;
+    UINT32 dictionarySize = 0;
+    UByteArray decompressed;
+    UByteArray efiDecompressed;
+    USTATUS result = decompress(model->body(index), compressionType, algorithm, dictionarySize, decompressed, efiDecompressed);
     if (result) {
-        msg(QObject::tr("parseCompressedSectionBody: decompression failed with error \"%1\"").arg(errorCodeToQString(result)), index);
-        return ERR_SUCCESS;
+        msg(usprintf("%s: decompression failed with error ", __FUNCTION__) + errorCodeToUString(result), index);
+        return U_SUCCESS;
     }
     
     // Check reported uncompressed size
-    if (pdata.section.compressed.uncompressedSize != (UINT32)decompressed.size()) {
-        msg(QObject::tr("parseCompressedSectionBody: decompressed size stored in header %1h (%2) differs from actual %3h (%4)")
-            .hexarg(pdata.section.compressed.uncompressedSize)
-            .arg(pdata.section.compressed.uncompressedSize)
-            .hexarg(decompressed.size())
-            .arg(decompressed.size()), index);
-        model->addInfo(index, QObject::tr("\nActual decompressed size: %1h (%2)").hexarg(decompressed.size()).arg(decompressed.size()));
+    if (uncompressedSize != (UINT32)decompressed.size()) {
+        msg(usprintf("%s: decompressed size stored in header %Xh (%u) differs from actual %Xh (%u)",
+                     __FUNCTION__,
+                     uncompressedSize, uncompressedSize,
+                     (UINT32)decompressed.size(), (UINT32)decompressed.size()),
+            index);
+        model->addInfo(index, usprintf("\nActual decompressed size: %Xh (%u)", (UINT32)decompressed.size(), (UINT32)decompressed.size()));
     }
-
+    
     // Check for undecided compression algorithm, this is a special case
     if (algorithm == COMPRESSION_ALGORITHM_UNDECIDED) {
         // Try preparse of sections decompressed with Tiano algorithm
-        if (ERR_SUCCESS == parseSections(decompressed, index, true)) {
+        if (U_SUCCESS == parseSections(decompressed, index, true)) {
             algorithm = COMPRESSION_ALGORITHM_TIANO;
         }
         // Try preparse of sections decompressed with EFI 1.1 algorithm
-        else if (ERR_SUCCESS == parseSections(efiDecompressed, index, true)) {
+        else if (U_SUCCESS == parseSections(efiDecompressed, index, true)) {
             algorithm = COMPRESSION_ALGORITHM_EFI11;
             decompressed = efiDecompressed;
         }
         else {
-            msg(QObject::tr("parseCompressedSectionBody: can't guess the correct decompression algorithm, both preparse steps are failed"), index);
+            msg(usprintf("%s: can't guess the correct decompression algorithm, both preparse steps are failed", __FUNCTION__), index);
         }
     }
-
+    
     // Add info
-    model->addInfo(index, QObject::tr("\nCompression algorithm: %1").arg(compressionTypeToQString(algorithm)));
-
-    // Update data
-    pdata.section.compressed.algorithm = algorithm;
-    if (algorithm != COMPRESSION_ALGORITHM_NONE)
+    model->addInfo(index, UString("\nCompression algorithm: ") + compressionTypeToUString(algorithm));
+    if (algorithm == COMPRESSION_ALGORITHM_LZMA || algorithm == COMPRESSION_ALGORITHM_LZMA_INTEL_LEGACY) {
+        model->addInfo(index, usprintf("\nLZMA dictionary size: %Xh", dictionarySize));
+    }
+    
+    // Set compression data
+    if (algorithm != COMPRESSION_ALGORITHM_NONE) {
+        model->setUncompressedData(index, decompressed);
         model->setCompressed(index, true);
-    model->setParsingData(index, parsingDataToQByteArray(pdata));
+    }
+    
+    // Set parsing data
+    COMPRESSED_SECTION_PARSING_DATA pdata = {};
+    pdata.algorithm = algorithm;
+    pdata.dictionarySize = dictionarySize;
+    pdata.compressionType = compressionType;
+    pdata.uncompressedSize = uncompressedSize;
+    model->setParsingData(index, UByteArray((const char*)&pdata, sizeof(pdata)));
     
     // Parse decompressed data
     return parseSections(decompressed, index);
 }
 
-STATUS FfsParser::parseGuidedSectionBody(const QModelIndex & index)
+USTATUS FfsParser::parseGuidedSectionBody(const UModelIndex & index)
 {
     // Sanity check
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
-    // Get data from parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-    EFI_GUID guid = pdata.section.guidDefined.guid;
-
+        return U_INVALID_PARAMETER;
+    
+    // Obtain required information from parsing data
+    EFI_GUID guid = { 0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0 }};
+    if (model->hasEmptyParsingData(index) == false) {
+        UByteArray data = model->parsingData(index);
+        const GUIDED_SECTION_PARSING_DATA* pdata = (const GUIDED_SECTION_PARSING_DATA*)data.constData();
+        guid = readUnaligned(pdata).guid;
+    }
+    
     // Check if section requires processing
-    QByteArray processed = model->body(index);
-    QByteArray efiDecompressed;
-    QString info;
+    UByteArray processed = model->body(index);
+    UByteArray efiDecompressed;
+    UString info;
     bool parseCurrentSection = true;
     UINT8 algorithm = COMPRESSION_ALGORITHM_NONE;
+    UINT32 dictionarySize = 0;
+    UByteArray baGuid = UByteArray((const char*)&guid, sizeof(EFI_GUID));
     // Tiano compressed section
-    if (QByteArray((const char*)&guid, sizeof(EFI_GUID)) == EFI_GUIDED_SECTION_TIANO) {
-        algorithm = EFI_STANDARD_COMPRESSION;
-        STATUS result = decompress(model->body(index), algorithm, processed, efiDecompressed);
+    if (baGuid == EFI_GUIDED_SECTION_TIANO) {
+        USTATUS result = decompress(model->body(index), EFI_STANDARD_COMPRESSION, algorithm, dictionarySize, processed, efiDecompressed);
         if (result) {
-            parseCurrentSection = false;
-            msg(QObject::tr("parseGuidedSectionBody: decompression failed with error \"%1\"").arg(errorCodeToQString(result)), index);
-            return ERR_SUCCESS;
+            msg(usprintf("%s: decompression failed with error ", __FUNCTION__) + errorCodeToUString(result), index);
+            return U_SUCCESS;
         }
-
+        
         // Check for undecided compression algorithm, this is a special case
         if (algorithm == COMPRESSION_ALGORITHM_UNDECIDED) {
             // Try preparse of sections decompressed with Tiano algorithm
-            if (ERR_SUCCESS == parseSections(processed, index, true)) {
+            if (U_SUCCESS == parseSections(processed, index, true)) {
                 algorithm = COMPRESSION_ALGORITHM_TIANO;
             }
             // Try preparse of sections decompressed with EFI 1.1 algorithm
-            else if (ERR_SUCCESS == parseSections(efiDecompressed, index, true)) {
+            else if (U_SUCCESS == parseSections(efiDecompressed, index, true)) {
                 algorithm = COMPRESSION_ALGORITHM_EFI11;
                 processed = efiDecompressed;
             }
             else {
-                msg(QObject::tr("parseGuidedSectionBody: can't guess the correct decompression algorithm, both preparse steps are failed"), index);
-				parseCurrentSection = false;
+                msg(usprintf("%s: can't guess the correct decompression algorithm, both preparse steps are failed", __FUNCTION__), index);
+                parseCurrentSection = false;
             }
         }
         
-        info += QObject::tr("\nCompression algorithm: %1").arg(compressionTypeToQString(algorithm));
-        info += QObject::tr("\nDecompressed size: %1h (%2)").hexarg(processed.length()).arg(processed.length());
+        info = UString("\nCompression algorithm: ") + compressionTypeToUString(algorithm)
+            + usprintf("\nDecompressed size: %Xh (%u)", (UINT32)processed.size(), (UINT32)processed.size());
     }
     // LZMA compressed section
-    else if (QByteArray((const char*)&guid, sizeof(EFI_GUID)) == EFI_GUIDED_SECTION_LZMA) {
-        algorithm = EFI_CUSTOMIZED_COMPRESSION;
-        STATUS result = decompress(model->body(index), algorithm, processed, efiDecompressed);
+    else if (baGuid == EFI_GUIDED_SECTION_LZMA
+             || baGuid == EFI_GUIDED_SECTION_LZMA_HP
+             || baGuid == EFI_GUIDED_SECTION_LZMA_MS) {
+        USTATUS result = decompress(model->body(index), EFI_CUSTOMIZED_COMPRESSION, algorithm, dictionarySize, processed, efiDecompressed);
         if (result) {
-            parseCurrentSection = false;
-            msg(QObject::tr("parseGuidedSectionBody: decompression failed with error \"%1\"").arg(errorCodeToQString(result)), index);
-            return ERR_SUCCESS;
+            msg(usprintf("%s: decompression failed with error ", __FUNCTION__) + errorCodeToUString(result), index);
+            return U_SUCCESS;
         }
-
+        
         if (algorithm == COMPRESSION_ALGORITHM_LZMA) {
-            info += QObject::tr("\nCompression algorithm: LZMA");
-            info += QObject::tr("\nDecompressed size: %1h (%2)").hexarg(processed.length()).arg(processed.length());
+            info = UString("\nCompression algorithm: LZMA")
+                + usprintf("\nDecompressed size: %Xh (%u)", (UINT32)processed.size(), (UINT32)processed.size())
+                + usprintf("\nLZMA dictionary size: %Xh\n", dictionarySize);
         }
         else {
-            info += QObject::tr("\nCompression algorithm: unknown");
-			parseCurrentSection = false;
-		}
+            info = UString("Compression algorithm: unknown");
+            parseCurrentSection = false;
+        }
     }
+    // LZMAF86 compressed section
+    else if (baGuid == EFI_GUIDED_SECTION_LZMAF86) {
+        USTATUS result = decompress(model->body(index), EFI_CUSTOMIZED_COMPRESSION_LZMAF86, algorithm, dictionarySize, processed, efiDecompressed);
+        if (result) {
+            msg(usprintf("%s: decompression failed with error ", __FUNCTION__) + errorCodeToUString(result), index);
+            return U_SUCCESS;
+        }
+        
+        if (algorithm == COMPRESSION_ALGORITHM_LZMAF86) {
+            info = UString("\nCompression algorithm: LZMAF86")
+                + usprintf("\nDecompressed size: %Xh (%u)", (UINT32)processed.size(), (UINT32)processed.size())
+                + usprintf("\nLZMA dictionary size: %Xh", dictionarySize);
+        }
+        else {
+            info = UString("\nCompression algorithm: unknown");
+            parseCurrentSection = false;
+        }
+    }
+    // GZip compressed section
+    else if (baGuid == EFI_GUIDED_SECTION_GZIP) {
+        USTATUS result = gzipDecompress(model->body(index), processed);
+        if (result) {
+            msg(usprintf("%s: decompression failed with error ", __FUNCTION__) + errorCodeToUString(result), index);
+            return U_SUCCESS;
+        }
 
+        algorithm = COMPRESSION_ALGORITHM_GZIP;
+        info = UString("\nCompression algorithm: GZip")
+            + usprintf("\nDecompressed size: %Xh (%u)", (UINT32)processed.size(), (UINT32)processed.size());
+    }
+    // Zlib compressed section
+    else if (baGuid == EFI_GUIDED_SECTION_ZLIB_AMD) {
+        USTATUS result = zlibDecompress(model->body(index), processed);
+        if (result) {
+            msg(usprintf("%s: decompression failed with error ", __FUNCTION__) + errorCodeToUString(result), index);
+            return U_SUCCESS;
+        }
+
+        algorithm = COMPRESSION_ALGORITHM_ZLIB;
+        info = UString("\nCompression algorithm: Zlib")
+            + usprintf("\nDecompressed size: %Xh (%u)", (UINT32)processed.size(), (UINT32)processed.size());
+    }
+    // Brotli compressed section
+    else if (baGuid == EFI_GUIDED_SECTION_BROTLI)
+    {
+        USTATUS result = brotliDecompress(model->body(index), processed);
+        if (result) {
+            msg(usprintf("%s: decompression failed with error ", __FUNCTION__) + errorCodeToUString(result), index);
+            return U_SUCCESS;
+        }
+
+        algorithm = COMPRESSION_ALGORITHM_BROTLI;
+        info = UString("\nCompression algorithm: Brotli")
+            + usprintf("\nDecompressed size: %Xh (%u)", (UINT32)processed.size(), (UINT32)processed.size());
+    }
+    
     // Add info
     model->addInfo(index, info);
-
-    // Update data
-    if (algorithm != COMPRESSION_ALGORITHM_NONE)
+    
+    // Set parsing data
+    GUIDED_SECTION_PARSING_DATA pdata = {};
+    pdata.dictionarySize = dictionarySize;
+    model->setParsingData(index, UByteArray((const char*)&pdata, sizeof(pdata)));
+    
+    // Set compression data
+    if (algorithm != COMPRESSION_ALGORITHM_NONE) {
+        model->setUncompressedData(index, processed);
         model->setCompressed(index, true);
-    model->setParsingData(index, parsingDataToQByteArray(pdata));
-
-    if (!parseCurrentSection) {
-        msg(QObject::tr("parseGuidedSectionBody: GUID defined section can not be processed"), index);
-        return ERR_SUCCESS;
     }
-
-    return parseSections(processed, index);
+    
+    if (!parseCurrentSection) {
+        msg(usprintf("%s: GUID defined section can not be processed", __FUNCTION__), index);
+        return U_SUCCESS;
+    }
+    
+    return parseSections(processed, index, false);
 }
 
-STATUS FfsParser::parseVersionSectionBody(const QModelIndex & index)
+USTATUS FfsParser::parseVersionSectionBody(const UModelIndex & index)
 {
     // Sanity check
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
+        return U_INVALID_PARAMETER;
+    
     // Add info
-    model->addInfo(index, QObject::tr("\nVersion string: %1").arg(QString::fromUtf16((const CHAR16*)model->body(index).constData())));
-
-    return ERR_SUCCESS;
+    UByteArray body = model->body(index);
+    model->addInfo(index, UString("\nVersion string: ") + uFromUcs2(body.constData(), body.size()));
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseDepexSectionBody(const QModelIndex & index)
+USTATUS FfsParser::parseDepexSectionBody(const UModelIndex & index)
 {
     // Sanity check
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
-    QByteArray body = model->body(index);
-    QString parsed;
-
+        return U_INVALID_PARAMETER;
+    
+    UByteArray body = model->body(index);
+    UString parsed;
+    
     // Check data to be present
     if (body.size() < 2) { // 2 is a minimal sane value, i.e TRUE + END
-        msg(QObject::tr("parseDepexSectionBody: DEPEX section too short"), index);
-        return ERR_DEPEX_PARSE_FAILED;
+        msg(usprintf("%s: DEPEX section too short", __FUNCTION__), index);
+        return U_DEPEX_PARSE_FAILED;
     }
-
+    
     const EFI_GUID * guid;
     const UINT8* current = (const UINT8*)body.constData();
-
+    
     // Special cases of first opcode
     switch (*current) {
-    case EFI_DEP_BEFORE:
-        if (body.size() != 2 * EFI_DEP_OPCODE_SIZE + sizeof(EFI_GUID)) {
-            msg(QObject::tr("parseDepexSectionBody: DEPEX section too long for a section starting with BEFORE opcode"), index);
-            return ERR_SUCCESS;
-        }
-        guid = (const EFI_GUID*)(current + EFI_DEP_OPCODE_SIZE);
-        parsed += QObject::tr("\nBEFORE %1").arg(guidToQString(*guid));
-        current += EFI_DEP_OPCODE_SIZE + sizeof(EFI_GUID);
-        if (*current != EFI_DEP_END){
-            msg(QObject::tr("parseDepexSectionBody: DEPEX section ends with non-END opcode"), index);
-            return ERR_SUCCESS;
-        }
-        return ERR_SUCCESS;
-    case EFI_DEP_AFTER:
-        if (body.size() != 2 * EFI_DEP_OPCODE_SIZE + sizeof(EFI_GUID)){
-            msg(QObject::tr("parseDepexSectionBody: DEPEX section too long for a section starting with AFTER opcode"), index);
-            return ERR_SUCCESS;
-        }
-        guid = (const EFI_GUID*)(current + EFI_DEP_OPCODE_SIZE);
-        parsed += QObject::tr("\nAFTER %1").arg(guidToQString(*guid));
-        current += EFI_DEP_OPCODE_SIZE + sizeof(EFI_GUID);
-        if (*current != EFI_DEP_END) {
-            msg(QObject::tr("parseDepexSectionBody: DEPEX section ends with non-END opcode"), index);
-            return ERR_SUCCESS;
-        }
-        return ERR_SUCCESS;
-    case EFI_DEP_SOR:
-        if (body.size() <= 2 * EFI_DEP_OPCODE_SIZE) {
-            msg(QObject::tr("parseDepexSectionBody: DEPEX section too short for a section starting with SOR opcode"), index);
-            return ERR_SUCCESS;
-        }
-        parsed += QObject::tr("\nSOR");
-        current += EFI_DEP_OPCODE_SIZE;
-        break;
-    }
-
-    // Parse the rest of depex 
-    while (current - (const UINT8*)body.constData() < body.size()) {
-        switch (*current) {
-        case EFI_DEP_BEFORE: {
-            msg(QObject::tr("parseDepexSectionBody: misplaced BEFORE opcode"), index);
-            return ERR_SUCCESS;
-        }
-        case EFI_DEP_AFTER: {
-            msg(QObject::tr("parseDepexSectionBody: misplaced AFTER opcode"), index);
-            return ERR_SUCCESS;
-        }
-        case EFI_DEP_SOR: {
-            msg(QObject::tr("parseDepexSectionBody: misplaced SOR opcode"), index);
-            return ERR_SUCCESS;
-        }
-        case EFI_DEP_PUSH:
-            // Check that the rest of depex has correct size
-            if ((UINT32)body.size() - (UINT32)(current - (const UINT8*)body.constData()) <= EFI_DEP_OPCODE_SIZE + sizeof(EFI_GUID)) {
-                parsed.clear();
-                msg(QObject::tr("parseDepexSectionBody: remains of DEPEX section too short for PUSH opcode"), index);
-                return ERR_SUCCESS;
+        case EFI_DEP_BEFORE:
+            if (body.size() != 2 * EFI_DEP_OPCODE_SIZE + sizeof(EFI_GUID)) {
+                msg(usprintf("%s: DEPEX section too long for a section starting with BEFORE opcode", __FUNCTION__), index);
+                return U_SUCCESS;
             }
             guid = (const EFI_GUID*)(current + EFI_DEP_OPCODE_SIZE);
-            parsed += QObject::tr("\nPUSH %1").arg(guidToQString(*guid));
+            parsed += UString("\nBEFORE ") + guidToUString(readUnaligned(guid));
             current += EFI_DEP_OPCODE_SIZE + sizeof(EFI_GUID);
-            break;
-        case EFI_DEP_AND:
-            parsed += QObject::tr("\nAND");
-            current += EFI_DEP_OPCODE_SIZE;
-            break;
-        case EFI_DEP_OR:
-            parsed += QObject::tr("\nOR");
-            current += EFI_DEP_OPCODE_SIZE;
-            break;
-        case EFI_DEP_NOT:
-            parsed += QObject::tr("\nNOT");
-            current += EFI_DEP_OPCODE_SIZE;
-            break;
-        case EFI_DEP_TRUE:
-            parsed += QObject::tr("\nTRUE");
-            current += EFI_DEP_OPCODE_SIZE;
-            break;
-        case EFI_DEP_FALSE:
-            parsed += QObject::tr("\nFALSE");
-            current += EFI_DEP_OPCODE_SIZE;
-            break;
-        case EFI_DEP_END:
-            parsed += QObject::tr("\nEND");
-            current += EFI_DEP_OPCODE_SIZE;
-            // Check that END is the last opcode
-            if (current - (const UINT8*)body.constData() < body.size()) {
-                parsed.clear();
-                msg(QObject::tr("parseDepexSectionBody: DEPEX section ends with non-END opcode"), index);
+            if (*current != EFI_DEP_END){
+                msg(usprintf("%s: DEPEX section ends with non-END opcode", __FUNCTION__), index);
+                return U_SUCCESS;
             }
+            // No further parsing required
+            return U_SUCCESS;
+        case EFI_DEP_AFTER:
+            if (body.size() != 2 * EFI_DEP_OPCODE_SIZE + sizeof(EFI_GUID)){
+                msg(usprintf("%s: DEPEX section too long for a section starting with AFTER opcode", __FUNCTION__), index);
+                return U_SUCCESS;
+            }
+            guid = (const EFI_GUID*)(current + EFI_DEP_OPCODE_SIZE);
+            parsed += UString("\nAFTER ") + guidToUString(readUnaligned(guid));
+            current += EFI_DEP_OPCODE_SIZE + sizeof(EFI_GUID);
+            if (*current != EFI_DEP_END) {
+                msg(usprintf("%s: DEPEX section ends with non-END opcode", __FUNCTION__), index);
+                return U_SUCCESS;
+            }
+            // No further parsing required
+            return U_SUCCESS;
+        case EFI_DEP_SOR:
+            if (body.size() <= 2 * EFI_DEP_OPCODE_SIZE) {
+                msg(usprintf("%s: DEPEX section too short for a section starting with SOR opcode", __FUNCTION__), index);
+                return U_SUCCESS;
+            }
+            parsed += UString("\nSOR");
+            current += EFI_DEP_OPCODE_SIZE;
             break;
-        default:
-            msg(QObject::tr("parseDepexSectionBody: unknown opcode"), index);
-            return ERR_SUCCESS;
-            break;
+    }
+    
+    // Parse the rest of depex
+    while (current - (const UINT8*)body.constData() < body.size()) {
+        switch (*current) {
+            case EFI_DEP_BEFORE: {
+                msg(usprintf("%s: misplaced BEFORE opcode", __FUNCTION__), index);
+                return U_SUCCESS;
+            }
+            case EFI_DEP_AFTER: {
+                msg(usprintf("%s: misplaced AFTER opcode", __FUNCTION__), index);
+                return U_SUCCESS;
+            }
+            case EFI_DEP_SOR: {
+                msg(usprintf("%s: misplaced SOR opcode", __FUNCTION__), index);
+                return U_SUCCESS;
+            }
+            case EFI_DEP_PUSH:
+                // Check that the rest of depex has correct size
+                if ((UINT32)body.size() - (UINT32)(current - (const UINT8*)body.constData()) <= EFI_DEP_OPCODE_SIZE + sizeof(EFI_GUID)) {
+                    parsed.clear();
+                    msg(usprintf("%s: the rest of DEPEX section too short for PUSH opcode", __FUNCTION__), index);
+                    return U_SUCCESS;
+                }
+                guid = (const EFI_GUID*)(current + EFI_DEP_OPCODE_SIZE);
+                parsed += UString("\nPUSH ") + guidToUString(readUnaligned(guid));
+                current += EFI_DEP_OPCODE_SIZE + sizeof(EFI_GUID);
+                break;
+            case EFI_DEP_AND:
+                parsed += UString("\nAND");
+                current += EFI_DEP_OPCODE_SIZE;
+                break;
+            case EFI_DEP_OR:
+                parsed += UString("\nOR");
+                current += EFI_DEP_OPCODE_SIZE;
+                break;
+            case EFI_DEP_NOT:
+                parsed += UString("\nNOT");
+                current += EFI_DEP_OPCODE_SIZE;
+                break;
+            case EFI_DEP_TRUE:
+                parsed += UString("\nTRUE");
+                current += EFI_DEP_OPCODE_SIZE;
+                break;
+            case EFI_DEP_FALSE:
+                parsed += UString("\nFALSE");
+                current += EFI_DEP_OPCODE_SIZE;
+                break;
+            case EFI_DEP_END:
+                parsed += UString("\nEND");
+                current += EFI_DEP_OPCODE_SIZE;
+                // Check that END is the last opcode
+                if (current - (const UINT8*)body.constData() < body.size()) {
+                    parsed.clear();
+                    msg(usprintf("%s: DEPEX section ends with non-END opcode", __FUNCTION__), index);
+                }
+                break;
+            default:
+                msg(usprintf("%s: unknown opcode %02Xh", __FUNCTION__, *current), index);
+                // No further parsing required
+                return U_SUCCESS;
         }
     }
     
     // Add info
-    model->addInfo(index, QObject::tr("\nParsed expression:%1").arg(parsed));
-
-    return ERR_SUCCESS;
+    model->addInfo(index, UString("\nParsed expression:") + parsed);
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseUiSectionBody(const QModelIndex & index)
+USTATUS FfsParser::parseUiSectionBody(const UModelIndex & index)
 {
     // Sanity check
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
+        return U_INVALID_PARAMETER;
 
-    QString text = QString::fromUtf16((const CHAR16*)model->body(index).constData());
-
+    const auto body = model->body(index);
+    UString text = uFromUcs2(body.constData(), body.size());
+    
     // Add info
-    model->addInfo(index, QObject::tr("\nText: %1").arg(text));
-
+    model->addInfo(index, UString("\nText: ") + text);
+    
     // Rename parent file
     model->setText(model->findParentOfType(index, Types::File), text);
-
-    return ERR_SUCCESS;
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseAprioriRawSection(const QByteArray & body, QString & parsed)
+USTATUS FfsParser::parseAprioriRawSection(const UByteArray & body, UString & parsed)
 {
     // Sanity check
     if (body.size() % sizeof(EFI_GUID)) {
-        msg(QObject::tr("parseAprioriRawSection: apriori file has size is not a multiple of 16"));
+        msg(usprintf("%s: apriori file has size that is not a multiple of 16", __FUNCTION__));
     }
     parsed.clear();
-    UINT32 count = body.size() / sizeof(EFI_GUID);
+    UINT32 count = (UINT32)(body.size() / sizeof(EFI_GUID));
     if (count > 0) {
         for (UINT32 i = 0; i < count; i++) {
             const EFI_GUID* guid = (const EFI_GUID*)body.constData() + i;
-            parsed += QObject::tr("\n%1").arg(guidToQString(*guid));
+            parsed += "\n" + guidToUString(readUnaligned(guid));
         }
     }
-
-    return ERR_SUCCESS;
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseRawSectionBody(const QModelIndex & index)
+USTATUS FfsParser::parseRawSectionBody(const UModelIndex & index)
 {
     // Sanity check
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
+        return U_INVALID_PARAMETER;
+    
     // Check for apriori file
-    QModelIndex parentFile = model->findParentOfType(index, Types::File);
-
+    UModelIndex parentFile = model->findParentOfType(index, Types::File);
+    if (!parentFile.isValid())
+        return U_INVALID_RAW_AREA;
+    
     // Get parent file parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parentFile);
-    QByteArray parentFileGuid((const char*)&pdata.file.guid, sizeof(EFI_GUID));
-
+    UByteArray parentFileGuid(model->header(parentFile).constData(), sizeof(EFI_GUID));
     if (parentFileGuid == EFI_PEI_APRIORI_FILE_GUID) { // PEI apriori file
-        // Parse apriori file list
-        QString str;
-        STATUS result = parseAprioriRawSection(model->body(index), str);
-        if (!result && !str.isEmpty())
-            model->addInfo(index, QObject::tr("\nFile list:%1").arg(str));
-
         // Set parent file text
-        model->setText(parentFile, QObject::tr("PEI apriori file"));
-
-        return ERR_SUCCESS;
+        model->setText(parentFile, UString("PEI apriori file"));
+        // Parse apriori file list
+        UString str;
+        USTATUS result = parseAprioriRawSection(model->body(index), str);
+        if (!result && !str.isEmpty())
+            model->addInfo(index, UString("\nFile list:") + str);
+        return result;
     }
     else if (parentFileGuid == EFI_DXE_APRIORI_FILE_GUID) { // DXE apriori file
+        // Rename parent file
+        model->setText(parentFile, UString("DXE apriori file"));
         // Parse apriori file list
-        QString str;
-        STATUS result = parseAprioriRawSection(model->body(index), str);
+        UString str;
+        USTATUS result = parseAprioriRawSection(model->body(index), str);
         if (!result && !str.isEmpty())
-            model->addInfo(index, QObject::tr("\nFile list:%1").arg(str));
-
-        // Set parent file text
-        model->setText(parentFile, QObject::tr("DXE apriori file"));
-
-        return ERR_SUCCESS;
+            model->addInfo(index, UString("\nFile list:") + str);
+        return result;
     }
-    else if (parentFileGuid == NVRAM_NVAR_EXTERNAL_DEFAULTS_FILE_GUID) {
+    else if (parentFileGuid == NVRAM_NVAR_EXTERNAL_DEFAULTS_FILE_GUID) { // AMI NVRAM external defaults
+        // Rename parent file
+        model->setText(parentFile, UString("NVRAM external defaults"));
         // Parse NVAR area
-        parseNvarStore(index);
-
-        // Set parent file text
-        model->setText(parentFile, QObject::tr("NVRAM external defaults"));
+        return nvramParser->parseNvarStore(index);
+    }
+    else if (parentFileGuid == FFS_PHOENIX_RAW_SECTION_EVSA_GUID) { // Phoenix NVRAM external defaults
+        // Rename parent file
+        model->setText(parentFile, UString("Phoenix NVRAM EVSA"));
+        // Parse NVAR area
+        return nvramParser->parseNvramVolumeBody(index);
+    }
+    else if (parentFileGuid == PROTECTED_RANGE_VENDOR_HASH_FILE_GUID_AMI) { // AMI vendor hash file
+        // Parse AMI vendor hash file
+        return parseVendorHashFile(parentFileGuid, index);
+    }
+    else if (nvramParser->parseNvarStore(index, true) == U_SUCCESS) {
+        // Rename parent file
+        model->setName(index, UString(sectionTypeToUString(EFI_SECTION_RAW) + " section with NVAR store"));
+        return U_SUCCESS;
+    }
+    else if (parsePeImageSectionBody(index, true) == U_SUCCESS) {
+        // Rename parent file
+        model->setName(index, UString(sectionTypeToUString(EFI_SECTION_RAW) + " section with PE32 image"));
+        return U_SUCCESS;
+    }
+    else if (parseTeImageSectionBody(index, true) == U_SUCCESS) {
+        // Rename parent file
+        model->setName(index, UString(sectionTypeToUString(EFI_SECTION_RAW) + " section with TE image"));
+        return U_SUCCESS;
     }
 
     // Parse as raw area
@@ -2745,2130 +3725,3223 @@ STATUS FfsParser::parseRawSectionBody(const QModelIndex & index)
 }
 
 
-STATUS FfsParser::parsePeImageSectionBody(const QModelIndex & index)
+USTATUS FfsParser::parsePeImageSectionBody(const UModelIndex & index, const bool probe)
 {
     // Sanity check
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
+        return U_INVALID_PARAMETER;
+    
     // Get section body
-    QByteArray body = model->body(index);
+    UByteArray body = model->body(index);
     if ((UINT32)body.size() < sizeof(EFI_IMAGE_DOS_HEADER)) {
-        msg(QObject::tr("parsePeImageSectionBody: section body size is smaller than DOS header size"), index);
-        return ERR_SUCCESS;
+        if (probe)
+            return U_INVALID_IMAGE;
+        msg(usprintf("%s: section body size is smaller than DOS header size", __FUNCTION__), index);
+        return U_SUCCESS;
     }
-
-    QByteArray info;
+    
+    UString info;
     const EFI_IMAGE_DOS_HEADER* dosHeader = (const EFI_IMAGE_DOS_HEADER*)body.constData();
     if (dosHeader->e_magic != EFI_IMAGE_DOS_SIGNATURE) {
-        info += QObject::tr("\nDOS signature: %1h, invalid").hexarg2(dosHeader->e_magic, 4);
-        msg(QObject::tr("parsePeImageSectionBody: PE32 image with invalid DOS signature"), index);
+        if (probe)
+            return U_INVALID_IMAGE;
+        info += usprintf("\nDOS signature: %04Xh, invalid", dosHeader->e_magic);
+        msg(usprintf("%s: PE32 image with invalid DOS signature", __FUNCTION__), index);
         model->addInfo(index, info);
-        return ERR_SUCCESS;
+        return U_SUCCESS;
     }
-
+    
     const EFI_IMAGE_PE_HEADER* peHeader = (EFI_IMAGE_PE_HEADER*)(body.constData() + dosHeader->e_lfanew);
-    if (body.size() < (UINT8*)peHeader - (UINT8*)dosHeader) {
-        info += QObject::tr("\nDOS header: invalid");
-        msg(QObject::tr("parsePeImageSectionBody: PE32 image with invalid DOS header"), index);
+    if (body.size() < (UINT8*)peHeader - (UINT8*)dosHeader + sizeof(EFI_IMAGE_PE_HEADER)) {
+        if (probe)
+            return U_INVALID_IMAGE;
+        info += UString("\nDOS header: invalid");
+        msg(usprintf("%s: PE32 image with invalid DOS header", __FUNCTION__), index);
         model->addInfo(index, info);
-        return ERR_SUCCESS;
+        return U_SUCCESS;
     }
-
+    
     if (peHeader->Signature != EFI_IMAGE_PE_SIGNATURE) {
-        info += QObject::tr("\nPE signature: %1h, invalid").hexarg2(peHeader->Signature, 8);
-        msg(QObject::tr("parsePeImageSectionBody: PE32 image with invalid PE signature"), index);
+        if (probe)
+            return U_INVALID_IMAGE;
+        info += usprintf("\nPE signature: %08Xh, invalid", peHeader->Signature);
+        msg(usprintf("%s: PE32 image with invalid PE signature", __FUNCTION__), index);
         model->addInfo(index, info);
-        return ERR_SUCCESS;
+        return U_SUCCESS;
     }
-
+    
     const EFI_IMAGE_FILE_HEADER* imageFileHeader = (const EFI_IMAGE_FILE_HEADER*)(peHeader + 1);
-    if (body.size() < (UINT8*)imageFileHeader - (UINT8*)dosHeader) {
-        info += QObject::tr("\nPE header: invalid");
-        msg(QObject::tr("parsePeImageSectionBody: PE32 image with invalid PE header"), index);
+    if (body.size() < (UINT8*)imageFileHeader - (UINT8*)dosHeader + sizeof(EFI_IMAGE_FILE_HEADER)) {
+        if (probe)
+            return U_INVALID_IMAGE;
+        info += UString("\nPE header: invalid");
+        msg(usprintf("%s: PE32 image with invalid PE header", __FUNCTION__), index);
         model->addInfo(index, info);
-        return ERR_SUCCESS;
+        return U_SUCCESS;
     }
-
-    info += QObject::tr("\nDOS signature: %1h\nPE signature: %2h\nMachine type: %3\nNumber of sections: %4\nCharacteristics: %5h")
-        .hexarg2(dosHeader->e_magic, 4)
-        .hexarg2(peHeader->Signature, 8)
-        .arg(machineTypeToQString(imageFileHeader->Machine))
-        .arg(imageFileHeader->NumberOfSections)
-        .hexarg2(imageFileHeader->Characteristics, 4);
-
-    EFI_IMAGE_OPTIONAL_HEADER_POINTERS_UNION optionalHeader;
+    
+    info += usprintf("\nDOS signature: %04Xh\nPE signature: %08Xh",
+                     dosHeader->e_magic,
+                     peHeader->Signature) +
+    UString("\nMachine type: ") + machineTypeToUString(imageFileHeader->Machine) +
+    usprintf("\nNumber of sections: %u\nCharacteristics: %04Xh",
+             imageFileHeader->NumberOfSections,
+             imageFileHeader->Characteristics);
+    
+    EFI_IMAGE_OPTIONAL_HEADER_POINTERS_UNION optionalHeader = {};
     optionalHeader.H32 = (const EFI_IMAGE_OPTIONAL_HEADER32*)(imageFileHeader + 1);
-    if (body.size() < (UINT8*)optionalHeader.H32 - (UINT8*)dosHeader) {
-        info += QObject::tr("\nPE optional header: invalid");
-        msg(QObject::tr("parsePeImageSectionBody: PE32 image with invalid PE optional header"), index);
+    if (body.size() < (UINT8*)optionalHeader.H32 - (UINT8*)dosHeader + sizeof(EFI_IMAGE_OPTIONAL_HEADER32)) {
+        if (probe)
+            return U_INVALID_IMAGE;
+        info += UString("\nPE optional header: invalid");
+        msg(usprintf("%s: PE32 image with invalid PE optional header", __FUNCTION__), index);
         model->addInfo(index, info);
-        return ERR_SUCCESS;
+        return U_SUCCESS;
     }
-
+    
     if (optionalHeader.H32->Magic == EFI_IMAGE_PE_OPTIONAL_HDR32_MAGIC) {
-        info += QObject::tr("\nOptional header signature: %1h\nSubsystem: %2h\nAddress of entry point: %3h\nBase of code: %4h\nImage base: %5h")
-            .hexarg2(optionalHeader.H32->Magic, 4)
-            .hexarg2(optionalHeader.H32->Subsystem, 4)
-            .hexarg(optionalHeader.H32->AddressOfEntryPoint)
-            .hexarg(optionalHeader.H32->BaseOfCode)
-            .hexarg(optionalHeader.H32->ImageBase);
+        info += usprintf("\nOptional header signature: %04Xh\nSubsystem: %04Xh\nAddress of entry point: %Xh\nBase of code: %Xh\nImage base: %Xh",
+                         optionalHeader.H32->Magic,
+                         optionalHeader.H32->Subsystem,
+                         optionalHeader.H32->AddressOfEntryPoint,
+                         optionalHeader.H32->BaseOfCode,
+                         optionalHeader.H32->ImageBase);
     }
     else if (optionalHeader.H32->Magic == EFI_IMAGE_PE_OPTIONAL_HDR64_MAGIC) {
-        info += QObject::tr("\nOptional header signature: %1h\nSubsystem: %2h\nAddress of entry point: %3h\nBase of code: %4h\nImage base: %5h")
-            .hexarg2(optionalHeader.H64->Magic, 4)
-            .hexarg2(optionalHeader.H64->Subsystem, 4)
-            .hexarg(optionalHeader.H64->AddressOfEntryPoint)
-            .hexarg(optionalHeader.H64->BaseOfCode)
-            .hexarg(optionalHeader.H64->ImageBase);
+        info += usprintf("\nOptional header signature: %04Xh\nSubsystem: %04Xh\nAddress of entry point: %Xh\nBase of code: %Xh\nImage base: %" PRIX64 "h",
+                         optionalHeader.H64->Magic,
+                         optionalHeader.H64->Subsystem,
+                         optionalHeader.H64->AddressOfEntryPoint,
+                         optionalHeader.H64->BaseOfCode,
+                         optionalHeader.H64->ImageBase);
     }
     else {
-        info += QObject::tr("\nOptional header signature: %1h, unknown").hexarg2(optionalHeader.H32->Magic, 4);
-        msg(QObject::tr("parsePeImageSectionBody: PE32 image with invalid optional PE header signature"), index);
+        if (probe)
+            return U_INVALID_IMAGE;
+        info += usprintf("\nOptional header signature: %04Xh, unknown", optionalHeader.H32->Magic);
+        msg(usprintf("%s: PE32 image with invalid optional PE header signature", __FUNCTION__), index);
     }
-
+    
     model->addInfo(index, info);
-    return ERR_SUCCESS;
+
+    // Search for AMD Microcode in certain PE images
+    searchForAmdMicrocode(index);
+
+    return U_SUCCESS;
 }
 
 
-STATUS FfsParser::parseTeImageSectionBody(const QModelIndex & index)
+USTATUS FfsParser::parseTeImageSectionBody(const UModelIndex & index, const bool probe)
 {
     // Check sanity
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
+        return U_INVALID_PARAMETER;
+    
     // Get section body
-    QByteArray body = model->body(index);
+    UByteArray body = model->body(index);
     if ((UINT32)body.size() < sizeof(EFI_IMAGE_TE_HEADER)) {
-        msg(QObject::tr("parsePeImageSectionBody: section body size is smaller than TE header size"), index);
-        return ERR_SUCCESS;
+        if (probe)
+            return U_INVALID_IMAGE;
+        msg(usprintf("%s: section body size is smaller than TE header size", __FUNCTION__), index);
+        return U_SUCCESS;
     }
-
-    QByteArray info;
+    
+    UString info;
     const EFI_IMAGE_TE_HEADER* teHeader = (const EFI_IMAGE_TE_HEADER*)body.constData();
     if (teHeader->Signature != EFI_IMAGE_TE_SIGNATURE) {
-        info += QObject::tr("\nSignature: %1h, invalid").hexarg2(teHeader->Signature, 4);
-        msg(QObject::tr("parseTeImageSectionBody: TE image with invalid TE signature"), index);
+        if (probe)
+            return U_INVALID_IMAGE;
+        info += usprintf("\nSignature: %04Xh, invalid", teHeader->Signature);
+        msg(usprintf("%s: TE image with invalid TE signature", __FUNCTION__), index);
     }
     else {
-        info += QObject::tr("\nSignature: %1h\nMachine type: %2\nNumber of sections: %3\nSubsystem: %4h\nStripped size: %5h (%6)\nBase of code: %7h\nAddress of entry point: %8h\nImage base: %9h\nAdjusted image base: %10h")
-            .hexarg2(teHeader->Signature, 4)
-            .arg(machineTypeToQString(teHeader->Machine))
-            .arg(teHeader->NumberOfSections)
-            .hexarg2(teHeader->Subsystem, 2)
-            .hexarg(teHeader->StrippedSize).arg(teHeader->StrippedSize)
-            .hexarg(teHeader->BaseOfCode)
-            .hexarg(teHeader->AddressOfEntryPoint)
-            .hexarg(teHeader->ImageBase)
-            .hexarg(teHeader->ImageBase + teHeader->StrippedSize - sizeof(EFI_IMAGE_TE_HEADER));
+        info += usprintf("\nSignature: %04Xh", teHeader->Signature) +
+        UString("\nMachine type: ") + machineTypeToUString(teHeader->Machine) +
+        usprintf("\nNumber of sections: %u\nSubsystem: %02Xh\nStripped size: %Xh (%u)\n"
+                 "Base of code: %Xh\nAddress of entry point: %Xh\nImage base: %" PRIX64 "h\nAdjusted image base: %" PRIX64 "h",
+                 teHeader->NumberOfSections,
+                 teHeader->Subsystem,
+                 teHeader->StrippedSize, teHeader->StrippedSize,
+                 teHeader->BaseOfCode,
+                 teHeader->AddressOfEntryPoint,
+                 teHeader->ImageBase,
+                 teHeader->ImageBase + teHeader->StrippedSize - sizeof(EFI_IMAGE_TE_HEADER));
     }
-
-    // Get data from parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-    pdata.section.teImage.imageBase = teHeader->ImageBase;
-    pdata.section.teImage.adjustedImageBase = teHeader->ImageBase + teHeader->StrippedSize - sizeof(EFI_IMAGE_TE_HEADER);
     
     // Update parsing data
-    model->setParsingData(index, parsingDataToQByteArray(pdata));
-
+    TE_IMAGE_SECTION_PARSING_DATA pdata = {};
+    pdata.imageBaseType = EFI_IMAGE_TE_BASE_OTHER; // Will be determined later
+    pdata.originalImageBase = (UINT32)teHeader->ImageBase;
+    pdata.adjustedImageBase = (UINT32)(teHeader->ImageBase + teHeader->StrippedSize - sizeof(EFI_IMAGE_TE_HEADER));
+    model->setParsingData(index, UByteArray((const char*)&pdata, sizeof(pdata)));
+    
     // Add TE info
     model->addInfo(index, info);
 
-    return ERR_SUCCESS;
+    // Search for AMD Microcode in certain TE images
+    searchForAmdMicrocode(index);
+
+    return U_SUCCESS;
 }
 
 
-STATUS FfsParser::performSecondPass(const QModelIndex & index)
+USTATUS FfsParser::performSecondPass(const UModelIndex & index)
 {
     // Sanity check
     if (!index.isValid() || !lastVtf.isValid())
-        return ERR_INVALID_PARAMETER;
-
+        return U_INVALID_PARAMETER;
+    
     // Check for compressed lastVtf
     if (model->compressed(lastVtf)) {
-        msg(QObject::tr("performSecondPass: the last VTF appears inside compressed item, the image may be damaged"), lastVtf);
-        return ERR_SUCCESS;
+        msg(usprintf("%s: the last VTF appears inside compressed item", __FUNCTION__), lastVtf);
+        return U_SUCCESS;
     }
-
-    // Get parsing data for the last VTF
-    PARSING_DATA pdata = parsingDataFromQModelIndex(lastVtf);
-
+    
     // Calculate address difference
-    const UINT32 vtfSize = model->header(lastVtf).size() + model->body(lastVtf).size() + model->tail(lastVtf).size();
-    const UINT32 diff = 0xFFFFFFFFUL - pdata.offset - vtfSize + 1;
-
-    // Apply address information to index and all it's child items
-    addMemoryAddressesRecursive(index, diff);
-
-    return ERR_SUCCESS;
+    const UINT32 vtfSize = model->fullSize(lastVtf);
+    addressDiff = 0xFFFFFFFFULL - model->base(lastVtf) - vtfSize + 1;
+    
+    // Parse reset vector data
+    parseResetVectorData();
+    
+    // Find and parse FIT
+    fitParser->parseFit(index);
+    
+    // Check protected ranges
+    checkProtectedRanges(index);
+    
+    // Check TE files to have original or adjusted base
+    checkTeImageBase(index);
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::addMemoryAddressesRecursive(const QModelIndex & index, const UINT32 diff)
+USTATUS FfsParser::parseResetVectorData()
+{
+    // Sanity check
+    if (!lastVtf.isValid())
+        return U_SUCCESS;
+    
+    // Check VTF to have enough space at the end to fit Reset Vector Data
+    UByteArray vtf = model->full(lastVtf);
+    if ((UINT32)vtf.size() < sizeof(X86_RESET_VECTOR_DATA))
+        return U_SUCCESS;
+    
+    const X86_RESET_VECTOR_DATA* resetVectorData = (const X86_RESET_VECTOR_DATA*)(vtf.constData() + vtf.size() - sizeof(X86_RESET_VECTOR_DATA));
+    
+    // Add info
+    UString info = usprintf("\nAP entry vector: %02X %02X %02X %02X %02X %02X %02X %02X\n"
+                            "Reset vector: %02X %02X %02X %02X %02X %02X %02X %02X\n"
+                            "PEI core entry point: %08Xh\n"
+                            "AP startup segment: %08Xh\n"
+                            "BootFV base address: %08Xh\n",
+                            resetVectorData->ApEntryVector[0], resetVectorData->ApEntryVector[1], resetVectorData->ApEntryVector[2], resetVectorData->ApEntryVector[3],
+                            resetVectorData->ApEntryVector[4], resetVectorData->ApEntryVector[5], resetVectorData->ApEntryVector[6], resetVectorData->ApEntryVector[7],
+                            resetVectorData->ResetVector[0], resetVectorData->ResetVector[1], resetVectorData->ResetVector[2], resetVectorData->ResetVector[3],
+                            resetVectorData->ResetVector[4], resetVectorData->ResetVector[5], resetVectorData->ResetVector[6], resetVectorData->ResetVector[7],
+                            resetVectorData->PeiCoreEntryPoint,
+                            resetVectorData->ApStartupSegment,
+                            resetVectorData->BootFvBaseAddress);
+    
+    model->addInfo(lastVtf, info);
+    return U_SUCCESS;
+}
+
+USTATUS FfsParser::checkTeImageBase(const UModelIndex & index)
+{
+    // Sanity check
+    if (!index.isValid()) {
+        return U_INVALID_PARAMETER;
+    }
+    
+    // Determine relocation type of uncompressed TE image sections
+    if (model->compressed(index) == false
+        && model->type(index) == Types::Section
+        && model->subtype(index) == EFI_SECTION_TE) {
+        // Obtain required values from parsing data
+        UINT32 originalImageBase = 0;
+        UINT32 adjustedImageBase = 0;
+        UINT8  imageBaseType = EFI_IMAGE_TE_BASE_OTHER;
+        if (model->hasEmptyParsingData(index) == false) {
+            UByteArray data = model->parsingData(index);
+            const TE_IMAGE_SECTION_PARSING_DATA* pdata = (const TE_IMAGE_SECTION_PARSING_DATA*)data.constData();
+            originalImageBase = readUnaligned(pdata).originalImageBase;
+            adjustedImageBase = readUnaligned(pdata).adjustedImageBase;
+        }
+        
+        if (originalImageBase != 0 || adjustedImageBase != 0) {
+            // Check data memory address to be equal to either OriginalImageBase or AdjustedImageBase
+            UINT64 address = addressDiff + model->base(index);
+            UINT32 base = (UINT32)(address + model->headerSize(index));
+            
+            if (originalImageBase == base) {
+                imageBaseType = EFI_IMAGE_TE_BASE_ORIGINAL;
+            }
+            else if (adjustedImageBase == base) {
+                imageBaseType = EFI_IMAGE_TE_BASE_ADJUSTED;
+            }
+            else {
+                // Check for one-bit difference
+                UINT32 xored = base ^ originalImageBase; // XOR result can't be zero
+                if ((xored & (xored - 1)) == 0) { // Check that XOR result is a power of 2, i.e. has exactly one bit set
+                    imageBaseType = EFI_IMAGE_TE_BASE_ORIGINAL;
+                }
+                else { // The same check for adjustedImageBase
+                    xored = base ^ adjustedImageBase;
+                    if ((xored & (xored - 1)) == 0) {
+                        imageBaseType = EFI_IMAGE_TE_BASE_ADJUSTED;
+                    }
+                }
+            }
+            
+            // Show message if imageBaseType is still unknown
+            if (imageBaseType == EFI_IMAGE_TE_BASE_OTHER) {
+                msg(usprintf("%s: TE image base is neither zero, nor original, nor adjusted, nor top-swapped", __FUNCTION__), index);
+            }
+            
+            // Update parsing data
+            TE_IMAGE_SECTION_PARSING_DATA pdata = {};
+            pdata.imageBaseType = imageBaseType;
+            pdata.originalImageBase = originalImageBase;
+            pdata.adjustedImageBase = adjustedImageBase;
+            model->setParsingData(index, UByteArray((const char*)&pdata, sizeof(pdata)));
+        }
+    }
+    
+    // Process child items
+    for (int i = 0; i < model->rowCount(index); i++) {
+        checkTeImageBase(index.model()->index(i, 0, index));
+    }
+    
+    return U_SUCCESS;
+}
+
+USTATUS FfsParser::addInfoRecursive(const UModelIndex & index, bool enableCpuAddresses)
 {
     // Sanity check
     if (!index.isValid())
-        return ERR_SUCCESS;
+        return U_INVALID_PARAMETER;
     
-    // Set address value for non-compressed data
-    if (!model->compressed(index)) {
-        // Get parsing data for the current item
-        PARSING_DATA pdata = parsingDataFromQModelIndex(index);
+    // Add tail size for elements with non-empty tails
+    if (!model->hasEmptyTail(index)) {
+        UINT32 tailSize = model->tailSize(index);
+        model->addInfo(index, usprintf("Tail size: %Xh (%u)\n", tailSize, tailSize), false);
+    }
+    
+    // Add body size for elements with non-empty bodies
+    if (!model->hasEmptyBody(index)) {
+        UINT32 bodySize = model->bodySize(index);
+        model->addInfo(index, usprintf("Body size: %Xh (%u)\n", bodySize, bodySize), false);
+    }
+    
+    // Add header size for elements with non-empty headers
+    if (!model->hasEmptyHeader(index)) {
+        UINT32 headerSize = model->headerSize(index);
+        model->addInfo(index, usprintf("Header size: %Xh (%u)\n", headerSize, headerSize), false);
+    }
+    
+    // Add full size for all elements
+    {
+        UINT32 fullSize = model->fullSize(index);
+        model->addInfo(index, usprintf("Full size: %Xh (%u)\n", fullSize, fullSize), false);
+        if (fullSize == 0)
+            msg(usprintf("%s: tree item of zero size", __FUNCTION__), index);
+    }
+    
+    // Add offset
+    model->addInfo(index, usprintf("Offset: %Xh\n", model->offset(index)), false);
 
-        // Check address sanity
-        if ((const UINT64)diff + pdata.offset <= 0xFFFFFFFFUL)  {
-            // Update info
-            pdata.address = diff + pdata.offset;
-            UINT32 headerSize = model->header(index).size();
-            if (headerSize) {
-                model->addInfo(index, QObject::tr("\nHeader memory address: %1h").hexarg2(pdata.address, 8));
-                model->addInfo(index, QObject::tr("\nData memory address: %1h").hexarg2(pdata.address + headerSize, 8));
+    // Add current base if the element is not compressed
+    // or it's compressed, but its parent isn't
+    if ((!model->compressed(index)) || (index.parent().isValid() && !model->compressed(index.parent()))) {
+        if (!enableCpuAddresses)
+            enableCpuAddresses = (model->type(index) == Types::Image && model->subtype(index) == Subtypes::UefiImage)
+                || (model->type(index) == Types::Region && model->subtype(index) == Subtypes::BiosRegion);
+        if (enableCpuAddresses) {
+            // Add physical address of the whole item or its header and data portions separately
+            UINT64 address = addressDiff + model->base(index);
+            for (int i = 0; i < indexesAddressDiffs.size(); i++) {
+                if (model->base(index) >= model->base(indexesAddressDiffs.at(i).first))
+                    address = indexesAddressDiffs.at(i).second + model->base(index);
             }
-            else {
-                model->addInfo(index, QObject::tr("\nMemory address: %1h").hexarg2(pdata.address, 8));
-            }
-
-            // Special case of uncompressed TE image sections
-            if (model->type(index) == Types::Section && model->subtype(index) == EFI_SECTION_TE) {
-                // Check data memory address to be equal to either ImageBase or AdjustedImageBase
-                if (pdata.section.teImage.imageBase == pdata.address + headerSize) {
-                    pdata.section.teImage.revision = 1;
-                }
-                else if (pdata.section.teImage.adjustedImageBase == pdata.address + headerSize) {
-                    pdata.section.teImage.revision = 2;
+            if (address <= 0xFFFFFFFFUL) {
+                UINT32 headerSize = model->headerSize(index);
+                if (headerSize) {
+                    if (!model->hasEmptyBody(index)) model->addInfo(index, usprintf("Data address: %08Xh\n", (UINT32)address + headerSize), false);
+                    model->addInfo(index, usprintf("Header address: %08Xh\n", (UINT32)address), false);
                 }
                 else {
-                    msg(QObject::tr("addMemoryAddressesRecursive: image base is nether original nor adjusted, it's likely a part of backup PEI volume or DXE volume, but can also be damaged"), index);
-                    pdata.section.teImage.revision = 0;
+                    model->addInfo(index, usprintf("Address: %08Xh\n", (UINT32)address), false);
                 }
             }
-
-            // Set modified parsing data
-            model->setParsingData(index, parsingDataToQByteArray(pdata));
         }
+        // Add base
+        model->addInfo(index, usprintf("Base: %Xh\n", model->base(index)), false);
     }
-
-    // Process child items
-    for (int i = 0; i < model->rowCount(index); i++) {
-        addMemoryAddressesRecursive(index.child(i, 0), diff);
-    }
-
-    return ERR_SUCCESS;
-}
-
-STATUS FfsParser::addOffsetsRecursive(const QModelIndex & index)
-{
-    // Sanity check
-    if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
     
-    // Get parsing data for the current item
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-
-    // Add current offset if the element is not compressed
-    // or it's compressed, but it's parent isn't
-    if ((!model->compressed(index)) || (index.parent().isValid() && !model->compressed(index.parent()))) {
-        model->addInfo(index, QObject::tr("Offset: %1h\n").hexarg(pdata.offset), false);
-    }
-
-    //TODO: show FIT file fixed attribute correctly
-    model->addInfo(index, QObject::tr("\nCompressed: %1").arg(model->compressed(index) ? QObject::tr("Yes") : QObject::tr("No")));
-    model->addInfo(index, QObject::tr("\nFixed: %1").arg(model->fixed(index) ? QObject::tr("Yes") : QObject::tr("No")));
-
+    // TODO: add Fixed information once the new builder is ready
+    // model->addInfo(index, usprintf("Fixed: %s\n", model->fixed(index) ? "Yes" : "No"), false);
+    
     // Process child items
     for (int i = 0; i < model->rowCount(index); i++) {
-        addOffsetsRecursive(index.child(i, 0));
+        addInfoRecursive(index.model()->index(i, 0, index), enableCpuAddresses);
     }
-
-    return ERR_SUCCESS;
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseNvarStore(const QModelIndex & index)
+USTATUS FfsParser::checkProtectedRanges(const UModelIndex & index)
 {
     // Sanity check
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
-    // Get parsing data for the current item
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-    UINT32 parentOffset = pdata.offset + model->header(index).size();
-
-    // Get item data
-    const QByteArray data = model->body(index);
-
-    // Rename parent file
-    model->setText(model->findParentOfType(index, Types::File), QObject::tr("NVAR store"));
-
-    UINT32 offset = 0;
-    UINT32 guidsInStore = 0;
-    const UINT8 emptyByte = pdata.emptyByte;
-    // Parse all entries
-    while (1) {
-        bool msgUnknownExtDataFormat = false;
-        bool msgExtHeaderTooLong = false;
-        bool msgExtDataTooShort = false;
-
-        bool isInvalid = false;
-        bool isInvalidLink = false;
-        bool isDataOnly = false;
-        bool hasExtendedHeader = false;
-        bool hasChecksum = false;
-        bool hasTimestampAndHash = false;
-        bool hasGuidIndex = false;
-
-        UINT32 guidIndex = 0;
-        UINT8  storedChecksum = 0;
-        UINT8  calculatedChecksum = 0;
-        UINT32 extendedHeaderSize = 0;
-        UINT8  extendedAttributes = 0;
-        UINT64 timestamp = 0;
-        QByteArray hash;
-
-        UINT8 subtype = Subtypes::FullNvarEntry;
-        QString name;
-        QString text;
-        QByteArray header;
-        QByteArray body;
-        QByteArray tail;
+        return U_INVALID_PARAMETER;
+    
+    // QByteArray (Qt builds) supports obtaining data from invalid offsets in QByteArray,
+    // so mid() here doesn't throw anything for UEFITool, just returns ranges with all zeroes
+    // UByteArray (non-Qt builds) throws an exception that needs to be caught every time or the tools will crash.
+    
+    // Calculate digest for BG-protected ranges
+    UByteArray protectedParts;
+    bool bgProtectedRangeFound = false;
+    try {
+        for (UINT32 i = 0; i < (UINT32)protectedRanges.size(); i++) {
+            if (protectedRanges[i].Type == PROTECTED_RANGE_INTEL_BOOT_GUARD_IBB) {
+                bgProtectedRangeFound = true;
+                if ((UINT64)protectedRanges[i].Offset >= addressDiff) {
+                    protectedRanges[i].Offset -= (UINT32)addressDiff;
+                } else {
+                    msg(usprintf("%s: suspicious protected range offset", __FUNCTION__), index);
+                }
+                protectedParts += openedImage.mid(protectedRanges[i].Offset, protectedRanges[i].Size);
+                markProtectedRangeRecursive(index, protectedRanges[i]);
+            }
+        }
+    } catch (...) {
+        bgProtectedRangeFound = false;
+    }
+    
+    if (bgProtectedRangeFound) {
+        UINT8 digest[SHA512_HASH_SIZE] = {};
+        UString digestString;
+        UString ibbDigests;
+        // SHA1
+        digestString = "";
+        sha1(protectedParts.constData(), protectedParts.size(), digest);
+        for (UINT8 i = 0; i < SHA1_HASH_SIZE; i++) {
+            digestString += usprintf("%02X", digest[i]);
+        }
+        ibbDigests += UString("Computed IBB Hash (SHA1): ") + digestString + "\n";
+        // SHA256
+        digestString = "";
+        sha256(protectedParts.constData(), protectedParts.size(), digest);
+        for (UINT8 i = 0; i < SHA256_HASH_SIZE; i++) {
+            digestString += usprintf("%02X", digest[i]);
+        }
+        ibbDigests += UString("Computed IBB Hash (SHA256): ") + digestString + "\n";
+        // SHA384
+        digestString = "";
+        sha384(protectedParts.constData(), protectedParts.size(), digest);
+        for (UINT8 i = 0; i < SHA384_HASH_SIZE; i++) {
+            digestString += usprintf("%02X", digest[i]);
+        }
+        ibbDigests += UString("Computed IBB Hash (SHA384): ") + digestString + "\n";
+        // SHA512
+        digestString = "";
+        sha512(protectedParts.constData(), protectedParts.size(), digest);
+        for (UINT8 i = 0; i < SHA512_HASH_SIZE; i++) {
+            digestString += usprintf("%02X", digest[i]);
+        }
+        ibbDigests += UString("Computed IBB Hash (SHA512): ") + digestString + "\n";
+        // SM3
+        digestString = "";
+        sm3(protectedParts.constData(), protectedParts.size(), digest);
+        for (UINT8 i = 0; i < SM3_HASH_SIZE; i++) {
+            digestString += usprintf("%02X", digest[i]);
+        }
+        ibbDigests += UString("Computed IBB Hash (SM3): ") + digestString + "\n";
         
-        UINT32 guidAreaSize = guidsInStore * sizeof(EFI_GUID);
-        UINT32 unparsedSize = (UINT32)data.size() - offset - guidAreaSize;
-
-        // Get entry header
-        const NVAR_ENTRY_HEADER* entryHeader = (const NVAR_ENTRY_HEADER*)(data.constData() + offset);
-        
-        // Check header size and signature
-        if (unparsedSize < sizeof(NVAR_ENTRY_HEADER) ||
-            entryHeader->Signature != NVRAM_NVAR_ENTRY_SIGNATURE ||
-            unparsedSize < entryHeader->Size) {
-
-            // Check if the data left is a free space or a padding
-            QByteArray padding = data.mid(offset, unparsedSize);
-            UINT8 type;
-            
-            if ((UINT32)padding.count(emptyByte) == unparsedSize) {
-                // It's a free space
-                name = QObject::tr("Free space");
-                type = Types::FreeSpace;
-                subtype = 0;
+        securityInfo += ibbDigests + "\n";
+    }
+    
+    // Calculate digests for vendor-protected ranges
+    for (UINT32 i = 0; i < (UINT32)protectedRanges.size(); i++) {
+        if (protectedRanges[i].Type == PROTECTED_RANGE_INTEL_BOOT_GUARD_POST_IBB) {
+            if (!dxeCore.isValid()) {
+                msg(usprintf("%s: can't determine DXE volume offset, post-IBB protected range hash can't be checked", __FUNCTION__), index);
             }
             else {
-                // Nothing is parsed yet, but the file is not empty 
-                if (!offset) {
-                    msg(QObject::tr("parseNvarStore: file can't be parsed as NVAR variables store"), index);
-                    return ERR_SUCCESS;
+                // Offset will be determined as the offset of root volume with first DXE core
+                UModelIndex dxeRootVolumeIndex = model->findLastParentOfType(dxeCore, Types::Volume);
+                if (!dxeRootVolumeIndex.isValid()) {
+                    msg(usprintf("%s: can't determine DXE volume offset, post-IBB protected range hash can't be checked", __FUNCTION__), index);
                 }
-
-                // It's a padding
-                name = QObject::tr("Padding");
-                type = Types::Padding;
-                subtype = getPaddingType(padding);
+                else {
+                    try {
+                        protectedRanges[i].Offset = model->base(dxeRootVolumeIndex);
+                        protectedRanges[i].Size = model->fullSize(dxeRootVolumeIndex);
+                        protectedParts = openedImage.mid(protectedRanges[i].Offset, protectedRanges[i].Size);
+                        
+                        // Calculate the hash
+                        UByteArray digest(SHA512_HASH_SIZE, '\x00');
+                        if (protectedRanges[i].AlgorithmId == TCG_HASH_ALGORITHM_ID_SHA1) {
+                            sha1(protectedParts.constData(), protectedParts.size(), digest.data());
+                            digest = digest.left(SHA1_HASH_SIZE);
+                        }
+                        else if (protectedRanges[i].AlgorithmId == TCG_HASH_ALGORITHM_ID_SHA256) {
+                            sha256(protectedParts.constData(), protectedParts.size(), digest.data());
+                            digest = digest.left(SHA256_HASH_SIZE);
+                        }
+                        else if (protectedRanges[i].AlgorithmId == TCG_HASH_ALGORITHM_ID_SHA384) {
+                            sha384(protectedParts.constData(), protectedParts.size(), digest.data());
+                            digest = digest.left(SHA384_HASH_SIZE);
+                        }
+                        else if (protectedRanges[i].AlgorithmId == TCG_HASH_ALGORITHM_ID_SHA512) {
+                            sha512(protectedParts.constData(), protectedParts.size(), digest.data());
+                            digest = digest.left(SHA512_HASH_SIZE);
+                        }
+                        else if (protectedRanges[i].AlgorithmId == TCG_HASH_ALGORITHM_ID_SM3) {
+                            sm3(protectedParts.constData(), protectedParts.size(), digest.data());
+                            digest = digest.left(SM3_HASH_SIZE);
+                        }
+                        else {
+                            msg(usprintf("%s: post-IBB protected range [%Xh:%Xh] uses unknown hash algorithm %04Xh", __FUNCTION__,
+                                         protectedRanges[i].Offset, protectedRanges[i].Offset + protectedRanges[i].Size, protectedRanges[i].AlgorithmId),
+                                model->findByBase(protectedRanges[i].Offset));
+                        }
+                        
+                        // Check the hash
+                        if (digest != protectedRanges[i].Hash) {
+                            msg(usprintf("%s: post-IBB protected range [%Xh:%Xh] hash mismatch, opened image may refuse to boot", __FUNCTION__,
+                                         protectedRanges[i].Offset, protectedRanges[i].Offset + protectedRanges[i].Size),
+                                model->findByBase(protectedRanges[i].Offset));
+                        }
+                        
+                        markProtectedRangeRecursive(index, protectedRanges[i]);
+                    }
+                    catch(...) {
+                        // Do nothing, this range is likely not found in the image
+                    }
+                }
             }
-            // Get info
-            QString info = QObject::tr("Full size: %1h (%2)")
-                .hexarg(padding.size()).arg(padding.size());
-            // Construct parsing data
-            pdata.offset = parentOffset + offset;
-            // Add tree item
-            model->addItem(type, subtype, name, QString(), info, QByteArray(), padding, QByteArray(), false, parsingDataToQByteArray(pdata), index);
-
-            // Add GUID store area
-            QByteArray guidArea = data.right(guidAreaSize);
-            // Get info
-            name = QObject::tr("GUID store area");
-            info = QObject::tr("Full size: %1h (%2)\nGUIDs in store: %3")
-                .hexarg(guidArea.size()).arg(guidArea.size())
-                .arg(guidsInStore);
-            // Construct parsing data
-            pdata.offset = parentOffset + offset + padding.size();
-            // Add tree item
-            model->addItem(Types::Padding, getPaddingType(guidArea), name, QString(), info, QByteArray(), guidArea, QByteArray(), false, parsingDataToQByteArray(pdata), index);
-
-            return ERR_SUCCESS;
         }
-        
-        // Contruct generic header and body
-        header = data.mid(offset, sizeof(NVAR_ENTRY_HEADER));
-        body = data.mid(offset + sizeof(NVAR_ENTRY_HEADER), entryHeader->Size - sizeof(NVAR_ENTRY_HEADER));
-
-        UINT32 lastVariableFlag = pdata.emptyByte ? 0xFFFFFF : 0;
-        
-        // Set default next to predefined last value
-        pdata.nvar.next = lastVariableFlag;
-
-        // Entry is marked as invalid
-        if ((entryHeader->Attributes & NVRAM_NVAR_ENTRY_VALID) == 0) { // Valid attribute is not set
-            isInvalid = true;
-            // Do not parse further
-            goto parsing_done;
-        }
-
-        // Add next node information to parsing data
-        if (entryHeader->Next != lastVariableFlag) {
-            subtype = Subtypes::LinkNvarEntry;
-            pdata.nvar.next = entryHeader->Next;
-        }
-        
-        // Entry with extended header
-        if (entryHeader->Attributes & NVRAM_NVAR_ENTRY_EXT_HEADER) {
-            hasExtendedHeader = true;
-            msgUnknownExtDataFormat = true;
-
-            extendedHeaderSize = *(UINT16*)(body.constData() + body.size() - sizeof(UINT16));
-            if (extendedHeaderSize > (UINT32)body.size()) {
-                msgExtHeaderTooLong = true;
-                isInvalid = true;
-                // Do not parse further
-                goto parsing_done;
+        else if (protectedRanges[i].Type == PROTECTED_RANGE_VENDOR_HASH_AMI_V1) {
+            if (!dxeCore.isValid()) {
+                msg(usprintf("%s: can't determine DXE volume offset, AMI v1 protected range hash can't be checked", __FUNCTION__), index);
             }
-
-            extendedAttributes = *(UINT8*)(body.constData() + body.size() - extendedHeaderSize);
-
-            // Variable with checksum
-            if (extendedAttributes & NVRAM_NVAR_ENTRY_EXT_CHECKSUM) {
-                // Get stored checksum
-                storedChecksum = *(UINT8*)(body.constData() + body.size() - sizeof(UINT16) - sizeof(UINT8));
-
-                // Recalculate checksum for the variable
-                calculatedChecksum = 0;
-                // Include entry data
-                UINT8* start = (UINT8*)(entryHeader + 1);
-                for (UINT8* p = start; p < start + entryHeader->Size - sizeof(NVAR_ENTRY_HEADER); p++) {
-                    calculatedChecksum += *p;
+            else {
+                // Offset will be determined as the offset of root volume with first DXE core
+                UModelIndex dxeRootVolumeIndex = model->findLastParentOfType(dxeCore, Types::Volume);
+                if (!dxeRootVolumeIndex.isValid()) {
+                    msg(usprintf("%s: can't determine DXE volume offset, AMI v1 protected range hash can't be checked", __FUNCTION__), index);
                 }
-                // Include entry size and flags
-                start = (UINT8*)&entryHeader->Size;
-                for (UINT8*p = start; p < start + sizeof(UINT16); p++) {
-                    calculatedChecksum += *p;
+                else {
+                    try {
+                        protectedRanges[i].Offset = model->base(dxeRootVolumeIndex);
+                        protectedParts = openedImage.mid(protectedRanges[i].Offset, protectedRanges[i].Size);
+
+                        UByteArray digest(SHA256_HASH_SIZE, '\x00');
+                        sha256(protectedParts.constData(), protectedParts.size(), digest.data());
+
+                        if (digest != protectedRanges[i].Hash) {
+                            msg(usprintf("%s: AMI v1 protected range [%Xh:%Xh] hash mismatch, opened image may refuse to boot", __FUNCTION__,
+                                protectedRanges[i].Offset, protectedRanges[i].Offset + protectedRanges[i].Size),
+                                model->findByBase(protectedRanges[i].Offset));
+                        }
+
+                        markProtectedRangeRecursive(index, protectedRanges[i]);
+                    }
+                    catch (...) {
+                        // Do nothing, this range is likely not found in the image
+                    }
                 }
-                // Include entry attributes
-                calculatedChecksum += entryHeader->Attributes;
+            }
+        }
+        else if (protectedRanges[i].Type == PROTECTED_RANGE_VENDOR_HASH_AMI_V2) {
+            try {
+                protectedRanges[i].Offset -= (UINT32)addressDiff;
+                protectedParts = openedImage.mid(protectedRanges[i].Offset, protectedRanges[i].Size);
                 
-                hasChecksum = true;
-                msgUnknownExtDataFormat = false;
+                UByteArray digest(SHA256_HASH_SIZE, '\x00');
+                sha256(protectedParts.constData(), protectedParts.size(), digest.data());
+                
+                if (digest != protectedRanges[i].Hash) {
+                    msg(usprintf("%s: AMI v2 protected range [%Xh:%Xh] hash mismatch, opened image may refuse to boot", __FUNCTION__,
+                                 protectedRanges[i].Offset, protectedRanges[i].Offset + protectedRanges[i].Size),
+                        model->findByBase(protectedRanges[i].Offset));
+                }
+                
+                markProtectedRangeRecursive(index, protectedRanges[i]);
             }
+            catch(...) {
+                // Do nothing, this range is likely not found in the image
+            }
+        }
+        else if (protectedRanges[i].Type == PROTECTED_RANGE_VENDOR_HASH_AMI_V3) {
+            try {
+                protectedRanges[i].Offset -= (UINT32)addressDiff;
+                protectedParts = openedImage.mid(protectedRanges[i].Offset, protectedRanges[i].Size);
+                markProtectedRangeRecursive(index, protectedRanges[i]);
 
-            tail = body.mid(body.size() - extendedHeaderSize);
-            body = body.left(body.size() - extendedHeaderSize);
+                // Process second range
+                if (i + 1 < (UINT32)protectedRanges.size() && protectedRanges[i + 1].Type == PROTECTED_RANGE_VENDOR_HASH_AMI_V3) {
+                    protectedRanges[i + 1].Offset -= (UINT32)addressDiff;
+                    protectedParts += openedImage.mid(protectedRanges[i + 1].Offset, protectedRanges[i + 1].Size);
+                    markProtectedRangeRecursive(index, protectedRanges[i + 1]);
 
-            // Entry with authenticated write (for SecureBoot)
-            if (entryHeader->Attributes & NVRAM_NVAR_ENTRY_AUTH_WRITE) {
-                if ((UINT32)tail.size() < sizeof(UINT64) + SHA256_HASH_SIZE) {
-                    msgExtDataTooShort = true;
-                    isInvalid = true;
-                    // Do not parse further
-                    goto parsing_done;
+                    // Process third range
+                    if (i + 2 < (UINT32)protectedRanges.size() && protectedRanges[i + 2].Type == PROTECTED_RANGE_VENDOR_HASH_AMI_V3) {
+                        protectedRanges[i + 2].Offset -= (UINT32)addressDiff;
+                        protectedParts += openedImage.mid(protectedRanges[i + 2].Offset, protectedRanges[i + 2].Size);
+                        markProtectedRangeRecursive(index, protectedRanges[i + 2]);
+
+                        // Process fourth range
+                        if (i + 3 < (UINT32)protectedRanges.size() && protectedRanges[i + 3].Type == PROTECTED_RANGE_VENDOR_HASH_AMI_V3) {
+                            protectedRanges[i + 3].Offset -= (UINT32)addressDiff;
+                            protectedParts += openedImage.mid(protectedRanges[i + 3].Offset, protectedRanges[i + 3].Size);
+                            markProtectedRangeRecursive(index, protectedRanges[i + 3]);
+                            i += 3; // Skip 3 already processed ranges
+                        }
+                        else {
+                            i += 2; // Skip 2 already processed ranges
+                        }
+                    }
+                    else {
+                        i += 1;  // Skip 1 already processed range
+                    }
                 }
 
-                timestamp = *(UINT64*)(tail.constData() + sizeof(UINT8));
-                hash = tail.mid(sizeof(UINT64) + sizeof(UINT8), SHA256_HASH_SIZE);
-                hasTimestampAndHash = true;
-                msgUnknownExtDataFormat = false;
-            }
-        }
-
-        // Entry is data-only (nameless and GUIDless entry or link)
-        if (entryHeader->Attributes & NVRAM_NVAR_ENTRY_DATA_ONLY) { // Data-only attribute is set
-            isInvalidLink = true;
-            QModelIndex nvarIndex;
-            // Search prevously added entries for a link to this variable //TODO:replace with linked lists
-            for (int i = 0; i < model->rowCount(index); i++) {
-                nvarIndex = index.child(i, 0);
-                PARSING_DATA nvarPdata = parsingDataFromQModelIndex(nvarIndex);
-                if (nvarPdata.nvar.isValid && nvarPdata.nvar.next + nvarPdata.offset - parentOffset == offset) { // Previous link is present and valid
-                    isInvalidLink = false;
-                    break;
+                UByteArray digest(SHA256_HASH_SIZE, '\x00');
+                sha256(protectedParts.constData(), protectedParts.size(), digest.data());
+                if (digest != protectedRanges[i].Hash) {
+                    msg(usprintf("%s: AMI v3 protected ranges hash mismatch, opened image may refuse to boot", __FUNCTION__));
                 }
             }
-            // Check if the link is valid
-            if (!isInvalidLink) {
-                // Use the name and text of the previous link
-                name = model->name(nvarIndex);
-                text = model->text(nvarIndex);
-
-                if (entryHeader->Next == lastVariableFlag)
-                    subtype = Subtypes::DataNvarEntry;
-            }
-
-            isDataOnly = true;
-            // Do not parse further
-            goto parsing_done;
-        }
-
-        // Get entry name
-        {
-            UINT32 nameOffset = (entryHeader->Attributes & NVRAM_NVAR_ENTRY_GUID) ? sizeof(EFI_GUID) : sizeof(UINT8); // GUID can be stored with the variable or in a separate store, so there will only be an index of it
-            CHAR8* namePtr = (CHAR8*)(entryHeader + 1) + nameOffset;
-            UINT32 nameSize = 0;
-            if (entryHeader->Attributes & NVRAM_NVAR_ENTRY_ASCII_NAME) { // Name is stored as ASCII string of CHAR8s
-                text = QString(namePtr);
-                nameSize = text.length() + 1;
-            }
-            else { // Name is stored as UCS2 string of CHAR16s
-                text = QString::fromUtf16((CHAR16*)namePtr);
-                nameSize = (text.length() + 1) * 2;
-            }
-
-            // Get entry GUID
-            if (entryHeader->Attributes & NVRAM_NVAR_ENTRY_GUID) { // GUID is strored in the variable itself
-                name = guidToQString(*(EFI_GUID*)(entryHeader + 1));
-            }
-            // GUID is stored in GUID list at the end of the store
-            else {
-                guidIndex = *(UINT8*)(entryHeader + 1);
-                if (guidsInStore < guidIndex + 1)
-                    guidsInStore = guidIndex + 1;
-
-                // The list begins at the end of the store and goes backwards
-                const EFI_GUID* guidPtr = (const EFI_GUID*)(data.constData() + data.size()) - 1 - guidIndex;
-                name = guidToQString(*guidPtr);
-                hasGuidIndex = true;
-            }
-
-            // Include name and GUID into the header and remove them from body
-            header = data.mid(offset, sizeof(NVAR_ENTRY_HEADER) + nameOffset + nameSize);
-            body = body.mid(nameOffset + nameSize);
-        }
-parsing_done:
-        QString info;
-
-        // Rename invalid entries according to their types
-        pdata.nvar.isValid = TRUE;
-        if (isInvalid) {
-            name = QObject::tr("Invalid");
-            subtype = Subtypes::InvalidNvarEntry;
-            pdata.nvar.isValid = FALSE;
-        }
-        else if (isInvalidLink) {
-            name = QObject::tr("Invalid link");
-            subtype = Subtypes::InvalidLinkNvarEntry;
-            pdata.nvar.isValid = FALSE;
-        }
-        else // Add GUID info for valid entries
-            info += QObject::tr("Variable GUID: %1\n").arg(name);
-        
-        // Add GUID index information
-        if (hasGuidIndex)
-            info += QObject::tr("GUID index: %1\n").arg(guidIndex);
-
-        // Add header, body and extended data info
-        info += QObject::tr("Full size: %1h (%2)\nHeader size: %3h (%4)\nBody size: %5h (%6)")
-            .hexarg(entryHeader->Size).arg(entryHeader->Size)
-            .hexarg(header.size()).arg(header.size())
-            .hexarg(body.size()).arg(body.size());
-        
-        // Add attributes info
-        info += QObject::tr("\nAttributes: %1h").hexarg2(entryHeader->Attributes, 2);
-        // Translate attributes to text
-        if (entryHeader->Attributes && entryHeader->Attributes != 0xFF)
-            info += QObject::tr(" (%1)").arg(nvarAttributesToQString(entryHeader->Attributes));
-
-
-        // Add next node info
-        if (!isInvalid && entryHeader->Next != lastVariableFlag)
-            info += QObject::tr("\nNext node at offset: %1h").hexarg(parentOffset + offset + entryHeader->Next);
-
-        // Add extended header info
-        if (hasExtendedHeader) {
-            info += QObject::tr("\nExtended header size: %1h (%2)\nExtended attributes: %3h (%4)")
-                .hexarg(extendedHeaderSize).arg(extendedHeaderSize)
-                .hexarg2(extendedAttributes, 2)
-                .arg(nvarExtendedAttributesToQString(extendedAttributes));
-
-            // Checksum
-            if (hasChecksum)
-                info += QObject::tr("\nChecksum: %1h%2").hexarg2(storedChecksum, 2)
-                    .arg(calculatedChecksum ? QObject::tr(", invalid, should be %1h").hexarg2(0x100 - calculatedChecksum, 2) : QObject::tr(", valid"));
-            // Authentication data
-            if (hasTimestampAndHash) {
-                info += QObject::tr("\nTimestamp: %1h\nHash: %2")
-                    .hexarg(timestamp).arg(QString(hash.toHex().toUpper()));
+            catch (...) {
+                // Do nothing, this range is likely not found in the image
             }
         }
-        
-        // Add correct offset to parsing data
-        pdata.offset = parentOffset + offset;
-
-        // Add tree item
-        QModelIndex varIndex = model->addItem(Types::NvarEntry, subtype, name, text, info, header, body, tail, false, parsingDataToQByteArray(pdata), index);
-
-        // Show messages
-        if (msgUnknownExtDataFormat) msg(QObject::tr("parseNvarStore: unknown extended data format"), varIndex);
-        if (msgExtHeaderTooLong)     msg(QObject::tr("parseNvarStore: extended header size (%1h) is greater than body size (%2h)")
-                                         .hexarg(extendedHeaderSize).hexarg(body.size()), varIndex);
-        if (msgExtDataTooShort)      msg(QObject::tr("parseNvarStore: extended header size (%1h) is too small for timestamp and hash")
-                                         .hexarg(tail.size()), varIndex);
-
-        // Try parsing the entry data as NVAR storage if it begins with NVAR signature
-        if ((subtype == Subtypes::DataNvarEntry || subtype == Subtypes::FullNvarEntry) 
-            && *(const UINT32*)body.constData() == NVRAM_NVAR_ENTRY_SIGNATURE)
-            parseNvarStore(varIndex);
-        
-        // Move to next exntry
-        offset += entryHeader->Size;
+        else if (protectedRanges[i].Type == PROTECTED_RANGE_VENDOR_HASH_PHOENIX) {
+            try {
+                protectedRanges[i].Offset += (UINT32)protectedRegionsBase;
+                protectedParts = openedImage.mid(protectedRanges[i].Offset, protectedRanges[i].Size);
+                
+                UByteArray digest(SHA256_HASH_SIZE, '\x00');
+                sha256(protectedParts.constData(), protectedParts.size(), digest.data());
+                
+                if (digest != protectedRanges[i].Hash) {
+                    msg(usprintf("%s: Phoenix protected range [%Xh:%Xh] hash mismatch, opened image may refuse to boot", __FUNCTION__,
+                                 protectedRanges[i].Offset, protectedRanges[i].Offset + protectedRanges[i].Size),
+                        model->findByBase(protectedRanges[i].Offset));
+                }
+                
+                markProtectedRangeRecursive(index, protectedRanges[i]);
+            }
+            catch(...) {
+                // Do nothing, this range is likely not found in the image
+            }
+        }
+        else if (protectedRanges[i].Type == PROTECTED_RANGE_VENDOR_HASH_MICROSOFT_PMDA) {
+            try {
+                protectedRanges[i].Offset -= (UINT32)addressDiff;
+                protectedParts = openedImage.mid(protectedRanges[i].Offset, protectedRanges[i].Size);
+                
+                // Calculate the hash
+                UByteArray digest(SHA512_HASH_SIZE, '\x00');
+                if (protectedRanges[i].AlgorithmId == TCG_HASH_ALGORITHM_ID_SHA1) {
+                    sha1(protectedParts.constData(), protectedParts.size(), digest.data());
+                    digest = digest.left(SHA1_HASH_SIZE);
+                }
+                else if (protectedRanges[i].AlgorithmId == TCG_HASH_ALGORITHM_ID_SHA256) {
+                    sha256(protectedParts.constData(), protectedParts.size(), digest.data());
+                    digest = digest.left(SHA256_HASH_SIZE);
+                }
+                else if (protectedRanges[i].AlgorithmId == TCG_HASH_ALGORITHM_ID_SHA384) {
+                    sha384(protectedParts.constData(), protectedParts.size(), digest.data());
+                    digest = digest.left(SHA384_HASH_SIZE);
+                }
+                else if (protectedRanges[i].AlgorithmId == TCG_HASH_ALGORITHM_ID_SHA512) {
+                    sha512(protectedParts.constData(), protectedParts.size(), digest.data());
+                    digest = digest.left(SHA512_HASH_SIZE);
+                }
+                else if (protectedRanges[i].AlgorithmId == TCG_HASH_ALGORITHM_ID_SM3) {
+                    sm3(protectedParts.constData(), protectedParts.size(), digest.data());
+                    digest = digest.left(SM3_HASH_SIZE);
+                }
+                else {
+                    msg(usprintf("%s: Microsoft PMDA protected range [%Xh:%Xh] uses unknown hash algorithm %04Xh", __FUNCTION__,
+                                 protectedRanges[i].Offset, protectedRanges[i].Offset + protectedRanges[i].Size, protectedRanges[i].AlgorithmId),
+                        model->findByBase(protectedRanges[i].Offset));
+                }
+                
+                // Check the hash
+                if (digest != protectedRanges[i].Hash) {
+                    msg(usprintf("%s: Microsoft PMDA protected range [%Xh:%Xh] hash mismatch, opened image may refuse to boot", __FUNCTION__,
+                                 protectedRanges[i].Offset, protectedRanges[i].Offset + protectedRanges[i].Size),
+                        model->findByBase(protectedRanges[i].Offset));
+                }
+                
+                markProtectedRangeRecursive(index, protectedRanges[i]);
+            }
+            catch(...) {
+                // Do nothing, this range is likely not found in the image
+            }
+        }
+        else if (protectedRanges[i].Type == PROTECTED_RANGE_VENDOR_HASH_INSYDE) {
+            try {
+                protectedRanges[i].Offset -= (UINT32)addressDiff;
+                protectedParts = openedImage.mid(protectedRanges[i].Offset, protectedRanges[i].Size);
+                
+                UByteArray digest(SHA256_HASH_SIZE, '\x00');
+                sha256(protectedParts.constData(), protectedParts.size(), digest.data());
+                
+                if (digest != protectedRanges[i].Hash) {
+                    msg(usprintf("%s: Insyde protected range [%Xh:%Xh] hash mismatch, opened image may refuse to boot", __FUNCTION__,
+                                 protectedRanges[i].Offset, protectedRanges[i].Offset + protectedRanges[i].Size),
+                        model->findByBase(protectedRanges[i].Offset));
+                }
+                
+                markProtectedRangeRecursive(index, protectedRanges[i]);
+            }
+            catch(...) {
+                // Do nothing, this range is likely not found in the image
+            }
+        }
     }
     
-    return ERR_SUCCESS;
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseNvramVolumeBody(const QModelIndex & index)
+USTATUS FfsParser::markProtectedRangeRecursive(const UModelIndex & index, const PROTECTED_RANGE & range)
 {
-    // Sanity check
     if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
-    // Get parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-    UINT32 parentOffset = pdata.offset + model->header(index).size();
-
-    // Get item data
-    QByteArray data = model->body(index);
-
-    // Search for first store
-    STATUS result;
-    UINT32 prevStoreOffset;
-    result = findNextStore(index, data, parentOffset, 0, prevStoreOffset);
-    if (result)
-        return result;
-
-    // First store is not at the beginning of volume body
-    QString name;
-    QString info;
-    if (prevStoreOffset > 0) {
-        // Get info
-        QByteArray padding = data.left(prevStoreOffset);
-        name = QObject::tr("Padding");
-        info = QObject::tr("Full size: %1h (%2)")
-            .hexarg(padding.size()).arg(padding.size());
-
-        // Construct parsing data
-        pdata.offset = parentOffset;
-
-        // Add tree item
-        model->addItem(Types::Padding, getPaddingType(padding), name, QString(), info, QByteArray(), padding, QByteArray(), true, parsingDataToQByteArray(pdata), index);
+        return U_SUCCESS;
+    
+    // Mark compressed items
+    UModelIndex parentIndex = model->parent(index);
+    if (parentIndex.isValid() && model->compressed(index) && model->compressed(parentIndex)) {
+        model->setMarking(index, model->marking(parentIndex));
     }
-
-    // Search for and parse all stores
-    UINT32 storeOffset = prevStoreOffset;
-    UINT32 prevStoreSize = 0;
-
-    while (!result)
-    {
-        // Padding between stores
-        if (storeOffset > prevStoreOffset + prevStoreSize) {
-            UINT32 paddingOffset = prevStoreOffset + prevStoreSize;
-            UINT32 paddingSize = storeOffset - paddingOffset;
-            QByteArray padding = data.mid(paddingOffset, paddingSize);
-
-            // Get info
-            name = QObject::tr("Padding");
-            info = QObject::tr("Full size: %1h (%2)")
-                .hexarg(padding.size()).arg(padding.size());
-
-            // Construct parsing data
-            pdata.offset = parentOffset + paddingOffset;
-
-            // Add tree item
-            model->addItem(Types::Padding, getPaddingType(padding), name, QString(), info, QByteArray(), padding, QByteArray(), true, parsingDataToQByteArray(pdata), index);
+    // Mark normal items
+    else {
+        UINT32 currentOffset = model->base(index);
+        UINT32 currentSize = model->fullSize(index);
+        
+        if (std::min(currentOffset + currentSize, range.Offset + range.Size) > std::max(currentOffset, range.Offset)) {
+            if (range.Offset <= currentOffset && currentOffset + currentSize <= range.Offset + range.Size) { // Mark as fully in range
+                if (range.Type == PROTECTED_RANGE_INTEL_BOOT_GUARD_IBB) {
+                    model->setMarking(index, BootGuardMarking::BootGuardFullyInRange);
+                }
+                else {
+                    model->setMarking(index, BootGuardMarking::VendorFullyInRange);
+                }
+            }
+            else { // Mark as partially in range
+                model->setMarking(index, BootGuardMarking::PartiallyInRange);
+            }
         }
-
-        // Get store size
-        UINT32 storeSize = 0;
-        result = getStoreSize(data, storeOffset, storeSize);
-        if (result) {
-            msg(QObject::tr("parseNvramVolumeBody: getStoreSize failed with error \"%1\"").arg(errorCodeToQString(result)), index);
-            return result;
-        }
-
-        // Check that current store is fully present in input
-        if (storeSize > (UINT32)data.size() || storeOffset + storeSize > (UINT32)data.size()) {
-            // Mark the rest as padding and finish parsing
-            QByteArray padding = data.mid(storeOffset);
-
-            // Get info
-            name = QObject::tr("Padding");
-            info = QObject::tr("Full size: %1h (%2)")
-                .hexarg(padding.size()).arg(padding.size());
-
-            // Construct parsing data
-            pdata.offset = parentOffset + storeOffset;
-
-            // Add tree item
-            QModelIndex paddingIndex = model->addItem(Types::Padding, getPaddingType(padding), name, QString(), info, QByteArray(), padding, QByteArray(), true, parsingDataToQByteArray(pdata), index);
-            msg(QObject::tr("parseNvramVolumeBody: one of stores inside overlaps the end of data"), paddingIndex);
-
-            // Update variables
-            prevStoreOffset = storeOffset;
-            prevStoreSize = padding.size();
-            break;
-        }
-
-        QByteArray store = data.mid(storeOffset, storeSize);
-        // Parse current store header
-        QModelIndex storeIndex;
-        result = parseStoreHeader(store, parentOffset + storeOffset, index, storeIndex);
-        if (result)
-            msg(QObject::tr("parseNvramVolumeBody: store header parsing failed with error \"%1\"").arg(errorCodeToQString(result)), index);
-
-        // Go to next store
-        prevStoreOffset = storeOffset;
-        prevStoreSize = storeSize;
-        result = findNextStore(index, data, parentOffset, storeOffset + prevStoreSize, storeOffset);
     }
+    
+    for (int i = 0; i < model->rowCount(index); i++) {
+        markProtectedRangeRecursive(index.model()->index(i, 0, index), range);
+    }
+    
+    return U_SUCCESS;
+}
 
-    // Padding/free space at the end
-    storeOffset = prevStoreOffset + prevStoreSize;
-    if ((UINT32)data.size() > storeOffset) {
-        QByteArray padding = data.mid(storeOffset);
-        UINT8 type;
-        UINT8 subtype;
-        if (padding.count(pdata.emptyByte) == padding.size()) {
-            // It's a free space
-            name = QObject::tr("Free space");
-            type = Types::FreeSpace;
-            subtype = 0;
+USTATUS FfsParser::parseVendorHashFile(const UByteArray & fileGuid, const UModelIndex & index)
+{
+    // Check sanity
+    if (!index.isValid()) {
+        return U_INVALID_PARAMETER;
+    }
+    
+    const UByteArray& body = model->body(index);
+    UINT32 size = (UINT32)body.size();
+    if (fileGuid == PROTECTED_RANGE_VENDOR_HASH_FILE_GUID_PHOENIX) {
+        if (size < sizeof(PROTECTED_RANGE_VENDOR_HASH_FILE_HEADER_PHOENIX)) {
+            msg(usprintf("%s: unknown or corrupted Phoenix protected ranges hash file", __FUNCTION__), index);
         }
         else {
-            // Nothing is parsed yet, but the file is not empty 
-            if (!storeOffset) {
-                msg(QObject::tr("parseNvramVolumeBody: can't be parsed as NVRAM volume"), index);
-                return ERR_SUCCESS;
-            }
+            const PROTECTED_RANGE_VENDOR_HASH_FILE_HEADER_PHOENIX* header = (const PROTECTED_RANGE_VENDOR_HASH_FILE_HEADER_PHOENIX*)body.constData();
+            if (header->Signature == BG_VENDOR_HASH_FILE_SIGNATURE_PHOENIX) {
+                if (size < sizeof(PROTECTED_RANGE_VENDOR_HASH_FILE_HEADER_PHOENIX) + header->NumEntries * sizeof(PROTECTED_RANGE_VENDOR_HASH_FILE_ENTRY)) {
+                    msg(usprintf("%s: unknown or corrupted Phoenix protected ranges hash file", __FUNCTION__), index);
+                }
+                else {
+                    if (header->NumEntries > 0) {
+                        bool protectedRangesFound = false;
+                        for (UINT32 i = 0; i < header->NumEntries; i++) {
+                            const PROTECTED_RANGE_VENDOR_HASH_FILE_ENTRY* entry = (const PROTECTED_RANGE_VENDOR_HASH_FILE_ENTRY*)(header + 1) + i;
+                            if (entry->Base != 0xFFFFFFFF && entry->Size != 0 && entry->Size != 0xFFFFFFFF) {
+                                protectedRangesFound = true;
+                                PROTECTED_RANGE range = {};
+                                range.Offset = entry->Base;
+                                range.Size = entry->Size;
+                                range.AlgorithmId = TCG_HASH_ALGORITHM_ID_SHA256;
+                                range.Hash = UByteArray((const char*)entry->Hash, sizeof(entry->Hash));
+                                range.Type = PROTECTED_RANGE_VENDOR_HASH_PHOENIX;
+                                protectedRanges.push_back(range);
+                            }
+                        }
 
-            // It's a padding
-            name = QObject::tr("Padding");
-            type = Types::Padding;
-            subtype = getPaddingType(padding);
+                        if (protectedRangesFound) {
+                            securityInfo += usprintf("Phoenix hash file found at base %08Xh\nProtected ranges:\n", model->base(index));
+                            for (UINT32 i = 0; i < header->NumEntries; i++) {
+                                const PROTECTED_RANGE_VENDOR_HASH_FILE_ENTRY* entry = (const PROTECTED_RANGE_VENDOR_HASH_FILE_ENTRY*)(header + 1) + i;
+                                securityInfo += usprintf("RelativeOffset: %08Xh Size: %Xh\nHash: ", entry->Base, entry->Size);
+                                for (UINT8 j = 0; j < sizeof(entry->Hash); j++) {
+                                    securityInfo += usprintf("%02X", entry->Hash[j]);
+                                }
+                                securityInfo += "\n";
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        // Add info
-        info = QObject::tr("Full size: %1h (%2)")
-            .hexarg(padding.size()).arg(padding.size());
+        model->setText(index, UString("Phoenix protected ranges hash file"));
+    }
+    else if (fileGuid == PROTECTED_RANGE_VENDOR_HASH_FILE_GUID_AMI) {
+        UModelIndex fileIndex = model->parent(index);
+        if (size == sizeof(PROTECTED_RANGE_VENDOR_HASH_FILE_HEADER_AMI_V1)) {
+            securityInfo += usprintf("AMI protected ranges hash file v1 found at base %08Xh\nProtected range:\n", model->base(fileIndex));
+            const PROTECTED_RANGE_VENDOR_HASH_FILE_HEADER_AMI_V1* entry = (const PROTECTED_RANGE_VENDOR_HASH_FILE_HEADER_AMI_V1*)(body.constData());
+            securityInfo += usprintf("Size: %Xh\nHash (SHA256): ", entry->Size);
+            for (UINT8 i = 0; i < sizeof(entry->Hash); i++) {
+                securityInfo += usprintf("%02X", entry->Hash[i]);
+            }
+            securityInfo += "\n";
 
-        // Construct parsing data
-        pdata.offset = parentOffset + storeOffset;
+            if (entry->Size != 0 && entry->Size != 0xFFFFFFFF) {
+                PROTECTED_RANGE range = {};
+                range.Offset = 0;
+                range.Size = entry->Size;
+                range.AlgorithmId = TCG_HASH_ALGORITHM_ID_SHA256;
+                range.Hash = UByteArray((const char*)entry->Hash, sizeof(entry->Hash));
+                range.Type = PROTECTED_RANGE_VENDOR_HASH_AMI_V1;
+                protectedRanges.push_back(range);
+            }
+
+            model->setText(fileIndex, UString("AMI v1 protected ranges hash file"));
+        }
+        else if (size == sizeof(PROTECTED_RANGE_VENDOR_HASH_FILE_HEADER_AMI_V2)) {
+            const PROTECTED_RANGE_VENDOR_HASH_FILE_HEADER_AMI_V2* entry = (const PROTECTED_RANGE_VENDOR_HASH_FILE_HEADER_AMI_V2*)(body.constData());
+
+            securityInfo += usprintf("AMI v2 protected ranges hash file found at base %08Xh\nProtected ranges:", model->base(fileIndex));
+            securityInfo += usprintf("\nAddress: %08Xh, Size: %Xh\nHash (SHA256): ", entry->Hash0.Base, entry->Hash0.Size);
+            for (UINT8 j = 0; j < sizeof(entry->Hash0.Hash); j++) {
+                securityInfo += usprintf("%02X", entry->Hash0.Hash[j]);
+            }
+            securityInfo += usprintf("\nAddress: %08Xh, Size: %Xh\nHash (SHA256): ", entry->Hash1.Base, entry->Hash1.Size);
+            for (UINT8 j = 0; j < sizeof(entry->Hash1.Hash); j++) {
+                securityInfo += usprintf("%02X", entry->Hash1.Hash[j]);
+            }
+            securityInfo += "\n";
+
+            if (entry->Hash0.Base != 0xFFFFFFFF && entry->Hash0.Size != 0 && entry->Hash0.Size != 0xFFFFFFFF) {
+                PROTECTED_RANGE range = {};
+                range.Offset = entry->Hash0.Base;
+                range.Size = entry->Hash0.Size;
+                range.AlgorithmId = TCG_HASH_ALGORITHM_ID_SHA256;
+                range.Hash = UByteArray((const char*)entry->Hash0.Hash, sizeof(entry->Hash0.Hash));
+                range.Type = PROTECTED_RANGE_VENDOR_HASH_AMI_V2;
+                protectedRanges.push_back(range);
+            }
+
+            if (entry->Hash1.Base != 0xFFFFFFFF && entry->Hash1.Size != 0 && entry->Hash1.Size != 0xFFFFFFFF) {
+                PROTECTED_RANGE range = {};
+                range.Offset = entry->Hash1.Base;
+                range.Size = entry->Hash1.Size;
+                range.AlgorithmId = TCG_HASH_ALGORITHM_ID_SHA256;
+                range.Hash = UByteArray((const char*)entry->Hash1.Hash, sizeof(entry->Hash1.Hash));
+                range.Type = PROTECTED_RANGE_VENDOR_HASH_AMI_V2;
+                protectedRanges.push_back(range);
+            }
+
+            model->setText(fileIndex, UString("AMI v2 protected ranges hash file"));
+        }
+        else if (size == sizeof(PROTECTED_RANGE_VENDOR_HASH_FILE_HEADER_AMI_V3)) {
+            const PROTECTED_RANGE_VENDOR_HASH_FILE_HEADER_AMI_V3* entry = (const PROTECTED_RANGE_VENDOR_HASH_FILE_HEADER_AMI_V3*)(body.constData());
+            securityInfo += usprintf("AMI v3 protected ranges hash file found at base %08Xh\nProtected ranges:", model->base(fileIndex));
+            securityInfo += usprintf("\nFvBaseSegment 0 Address: %08Xh, Size: %Xh", entry->FvMainSegmentBase[0], entry->FvMainSegmentSize[0]);
+            securityInfo += usprintf("\nFvBaseSegment 1 Address: %08Xh, Size: %Xh", entry->FvMainSegmentBase[1], entry->FvMainSegmentSize[1]);
+            securityInfo += usprintf("\nFvBaseSegment 2 Address: %08Xh, Size: %Xh", entry->FvMainSegmentBase[2], entry->FvMainSegmentSize[2]);
+            securityInfo += usprintf("\nNestedFvBase Address: %08Xh, Size: %Xh", entry->NestedFvBase, entry->NestedFvSize);
+            securityInfo += usprintf("\nHash (SHA256): ");
+            for (UINT8 j = 0; j < sizeof(entry->Hash); j++) {
+                securityInfo += usprintf("%02X", entry->Hash[j]);
+            }
+            securityInfo += "\n";
+
+            if (entry->FvMainSegmentBase[0] != 0xFFFFFFFF && entry->FvMainSegmentSize[0] != 0 && entry->FvMainSegmentSize[0] != 0xFFFFFFFF) {
+                PROTECTED_RANGE range = {};
+                range.Offset = entry->FvMainSegmentBase[0];
+                range.Size = entry->FvMainSegmentSize[0];
+                range.AlgorithmId = TCG_HASH_ALGORITHM_ID_SHA256;
+                range.Hash = UByteArray((const char*)entry->Hash, sizeof(entry->Hash));
+                range.Type = PROTECTED_RANGE_VENDOR_HASH_AMI_V3;
+                protectedRanges.push_back(range);
+            }
+
+            if (entry->FvMainSegmentBase[1] != 0xFFFFFFFF && entry->FvMainSegmentSize[1] != 0 && entry->FvMainSegmentSize[1] != 0xFFFFFFFF) {
+                PROTECTED_RANGE range = {};
+                range.Offset = entry->FvMainSegmentBase[1];
+                range.Size = entry->FvMainSegmentSize[1];
+                range.AlgorithmId = TCG_HASH_ALGORITHM_ID_SHA256;
+                range.Hash = UByteArray((const char*)entry->Hash, sizeof(entry->Hash));
+                range.Type = PROTECTED_RANGE_VENDOR_HASH_AMI_V3;
+                protectedRanges.push_back(range);
+            }
+
+            if (entry->FvMainSegmentBase[2] != 0xFFFFFFFF && entry->FvMainSegmentSize[2] != 0 && entry->FvMainSegmentSize[2] != 0xFFFFFFFF) {
+                PROTECTED_RANGE range = {};
+                range.Offset = entry->FvMainSegmentBase[2];
+                range.Size = entry->FvMainSegmentSize[2];
+                range.AlgorithmId = TCG_HASH_ALGORITHM_ID_SHA256;
+                range.Hash = UByteArray((const char*)entry->Hash, sizeof(entry->Hash));
+                range.Type = PROTECTED_RANGE_VENDOR_HASH_AMI_V3;
+                protectedRanges.push_back(range);
+            }
+
+            if (entry->NestedFvBase != 0xFFFFFFFF && entry->NestedFvSize != 0 && entry->NestedFvSize != 0xFFFFFFFF) {
+                PROTECTED_RANGE range = {};
+                range.Offset = entry->NestedFvBase;
+                range.Size = entry->NestedFvSize;
+                range.AlgorithmId = TCG_HASH_ALGORITHM_ID_SHA256;
+                range.Hash = UByteArray((const char*)entry->Hash, sizeof(entry->Hash));
+                range.Type = PROTECTED_RANGE_VENDOR_HASH_AMI_V3;
+                protectedRanges.push_back(range);
+            }
+
+            model->setText(fileIndex, UString("AMI v3 protected ranges hash file"));
+        }
+        else {
+            msg(usprintf("%s: unknown or corrupted AMI protected ranges hash file", __FUNCTION__), fileIndex);
+        }
+    }
+
+    return U_SUCCESS;
+}
+
+USTATUS FfsParser::parseMicrocodeVolumeBody(const UModelIndex & index)
+{
+    const UINT32 headerSize = model->headerSize(index);
+    const UINT32 bodySize = model->bodySize(index);
+    UINT32 offset = 0;
+    USTATUS result = U_SUCCESS;
+    
+    while(true) {
+        // Parse current microcode
+        UModelIndex currentMicrocode;
+        UByteArray ucode = model->body(index).mid(offset);
+        
+        // Check for empty area
+        if (getPaddingType(ucode) != Subtypes::DataPadding) {
+            result = U_INVALID_MICROCODE;
+        }
+        else {
+            result = parseIntelMicrocodeHeader(ucode, headerSize + offset, index, currentMicrocode);
+        }
+        
+        // Add the rest as padding
+        if (result) {
+            if (offset < bodySize) {
+                // Get info
+                UString name = UString("Padding");
+                
+                // Add tree item
+                model->addItem(headerSize + offset, Types::Padding, getPaddingType(ucode), name, UString(), UString(), UByteArray(), ucode, UByteArray(), Fixed, index);
+            }
+            return U_SUCCESS;
+        }
+        
+        // Get to next candidate
+        offset += model->fullSize(currentMicrocode);
+        if (offset >= bodySize)
+            break;
+    }
+    return U_SUCCESS;
+}
+
+USTATUS FfsParser::parseIntelMicrocodeHeader(const UByteArray & microcode, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index)
+{
+    // We have enough data to fit the header
+    if ((UINT32)microcode.size() <  sizeof(INTEL_MICROCODE_HEADER)) {
+        return U_INVALID_MICROCODE;
+    }
+    
+    const INTEL_MICROCODE_HEADER* ucodeHeader = (const INTEL_MICROCODE_HEADER*)microcode.constData();
+    
+    if (!intelMicrocodeHeaderValid(ucodeHeader)) {
+        return U_INVALID_MICROCODE;
+    }
+    
+    // We have enough data to fit the whole TotalSize
+    if ((UINT32)microcode.size() < ucodeHeader->TotalSize) {
+        return U_INVALID_MICROCODE;
+    }
+    
+    // Valid microcode found
+    UINT32 dataSize = ucodeHeader->DataSize;
+    if (dataSize == 0) {
+        dataSize = INTEL_MICROCODE_REAL_DATA_SIZE_ON_ZERO;
+    }
+    
+    // Cross check DataSize and TotalSize
+    if (ucodeHeader->TotalSize < sizeof(INTEL_MICROCODE_HEADER) + dataSize) {
+        return U_INVALID_MICROCODE;
+    }
+    
+    // Recalculate the whole microcode checksum
+    UByteArray tempMicrocode = microcode;
+    INTEL_MICROCODE_HEADER* tempUcodeHeader = (INTEL_MICROCODE_HEADER*)(tempMicrocode.data());
+    tempUcodeHeader->Checksum = 0;
+    UINT32 calculated = calculateChecksum32((const UINT32*)tempMicrocode.constData(), tempUcodeHeader->TotalSize);
+    bool msgInvalidChecksum = (ucodeHeader->Checksum != calculated);
+    
+    // Construct header, body and tail
+    UByteArray header = microcode.left(sizeof(INTEL_MICROCODE_HEADER));
+    UByteArray body = microcode.mid(sizeof(INTEL_MICROCODE_HEADER), dataSize);
+    UByteArray tail;
+    
+    // Check if the tail is present
+    if (ucodeHeader->TotalSize > sizeof(INTEL_MICROCODE_HEADER) + dataSize) {
+        tail = microcode.mid(sizeof(INTEL_MICROCODE_HEADER) + dataSize, ucodeHeader->TotalSize - (sizeof(INTEL_MICROCODE_HEADER) + dataSize));
+    }
+    
+    // Check if we have extended header in the tail
+    UString extendedHeaderInfo;
+    bool msgUnknownOrDamagedMicrocodeTail = false;
+    if ((UINT32)tail.size() >= sizeof(INTEL_MICROCODE_EXTENDED_HEADER)) {
+        const INTEL_MICROCODE_EXTENDED_HEADER* extendedHeader = (const INTEL_MICROCODE_EXTENDED_HEADER*)tail.constData();
+        
+        // Reserved bytes are all zeroes
+        bool extendedReservedBytesValid = true;
+        for (UINT8 i = 0; i < sizeof(extendedHeader->Reserved); i++) {
+            if (extendedHeader->Reserved[i] != 0x00) {
+                extendedReservedBytesValid = false;
+                break;
+            }
+        }
+        
+        // We have more than 0 entries and they are all in the tail
+        if (extendedReservedBytesValid
+            && extendedHeader->EntryCount > 0
+            && (UINT32)tail.size() == sizeof(INTEL_MICROCODE_EXTENDED_HEADER) + extendedHeader->EntryCount * sizeof(INTEL_MICROCODE_EXTENDED_HEADER_ENTRY)) {
+            // Recalculate extended header checksum
+            INTEL_MICROCODE_EXTENDED_HEADER* tempExtendedHeader = (INTEL_MICROCODE_EXTENDED_HEADER*)(tempMicrocode.data() + sizeof(INTEL_MICROCODE_HEADER) + dataSize);
+            tempExtendedHeader->Checksum = 0;
+            UINT32 extendedCalculated = calculateChecksum32((const UINT32*)tempExtendedHeader, sizeof(INTEL_MICROCODE_EXTENDED_HEADER) + extendedHeader->EntryCount * sizeof(INTEL_MICROCODE_EXTENDED_HEADER_ENTRY));
+            
+            extendedHeaderInfo = usprintf("\nExtended header entries: %u\nExtended header checksum: %08Xh, ",
+                                          extendedHeader->EntryCount,
+                                          extendedHeader->Checksum)
+            + (extendedHeader->Checksum == extendedCalculated ? UString("valid") : usprintf("invalid, should be %08Xh", extendedCalculated));
+            
+            const INTEL_MICROCODE_EXTENDED_HEADER_ENTRY* firstEntry = (const INTEL_MICROCODE_EXTENDED_HEADER_ENTRY*)(extendedHeader + 1);
+            for (UINT32 i = 0; i < extendedHeader->EntryCount; i++) {
+                const INTEL_MICROCODE_EXTENDED_HEADER_ENTRY* entry = (const INTEL_MICROCODE_EXTENDED_HEADER_ENTRY*)(firstEntry + i);
+                
+                // Recalculate checksum after patching
+                tempUcodeHeader->Checksum = 0;
+                tempUcodeHeader->PlatformIds = entry->PlatformIds;
+                tempUcodeHeader->ProcessorSignature = entry->ProcessorSignature;
+                UINT32 entryCalculated = calculateChecksum32((const UINT32*)tempMicrocode.constData(), sizeof(INTEL_MICROCODE_HEADER) + dataSize);
+                
+                extendedHeaderInfo += usprintf("\nCPU signature #%u: %08Xh\nCPU platform Id #%u: %08Xh\nChecksum #%u: %08Xh, ",
+                                               i + 1, entry->ProcessorSignature,
+                                               i + 1, entry->PlatformIds,
+                                               i + 1, entry->Checksum)
+                + (entry->Checksum == entryCalculated ? UString("valid") : usprintf("invalid, should be %08Xh", entryCalculated));
+            }
+        }
+        else {
+            msgUnknownOrDamagedMicrocodeTail = true;
+        }
+    }
+    else if (tail.size() != 0) {
+        msgUnknownOrDamagedMicrocodeTail = true;
+    }
+    
+    // Get microcode binary
+    UByteArray microcodeBinary = microcode.left(ucodeHeader->TotalSize);
+    
+    // Add info
+    UString name("Intel microcode");
+    UString info = usprintf("Date: %02X.%02X.%04x\nCPU signature: %08Xh\nRevision: %08Xh\nMinimal update revision: %08Xh\nCPU platform Id: %08Xh\nChecksum: %08Xh, ",
+                            ucodeHeader->DateDay,
+                            ucodeHeader->DateMonth,
+                            ucodeHeader->DateYear,
+                            ucodeHeader->ProcessorSignature,
+                            ucodeHeader->UpdateRevision,
+                            ucodeHeader->UpdateRevisionMin,
+                            ucodeHeader->PlatformIds,
+                            ucodeHeader->Checksum)
+    + (ucodeHeader->Checksum == calculated ? UString("valid") : usprintf("invalid, should be %08Xh", calculated))
+    + extendedHeaderInfo;
+    
+    // Add tree item
+    index = model->addItem(localOffset, Types::IntelMicrocode, 0, name, UString(), info, UByteArray(), microcodeBinary, UByteArray(), Fixed, parent);
+    if (msgInvalidChecksum)
+        msg(usprintf("%s: invalid microcode checksum %08Xh, should be %08Xh", __FUNCTION__, ucodeHeader->Checksum, calculated), index);
+    if (msgUnknownOrDamagedMicrocodeTail)
+        msg(usprintf("%s: extended header of size %Xh (%u) found, but it's damaged or has unknown format", __FUNCTION__, (UINT32)tail.size(), (UINT32)tail.size()), index);
+    
+    // No need to parse the body further for now
+    return U_SUCCESS;
+}
+
+USTATUS FfsParser::searchForAmdMicrocode(const UModelIndex &index) {
+    UModelIndex fileIndex = model->parent(index);
+    if (!fileIndex.isValid()) {
+        return U_INVALID_PARAMETER;
+    }
+
+    if (model->type(fileIndex) != Types::File) {
+        return U_INVALID_PARAMETER;
+    }
+
+    UByteArray fileHeader = model->header(fileIndex);
+    if (fileHeader.size() < sizeof(EFI_GUID)) {
+        return U_INVALID_PARAMETER;
+    }
+
+    USTATUS status = U_ITEM_NOT_FOUND;
+
+    UByteArray fileGuid = UByteArray(fileHeader.constData(), sizeof(EFI_GUID));
+    if (fileGuid != AMD_MICROCODE_FILE_GUID) {
+        return status;
+    }
+
+    UByteArray body = model->body(index);
+    UINT32 dataSize = (UINT32)body.size();
+    UINT32 minSize = sizeof(AMD_MICROCODE_HEADER) + 0x44;
+    if (dataSize < minSize) {
+        return U_INVALID_PARAMETER;
+    }
+
+    for (UINT32 offset = 0; offset < dataSize - minSize; offset++) {
+        const AMD_MICROCODE_HEADER* ucodeHeader = (const AMD_MICROCODE_HEADER*)(body.constData() + offset);
+        if (!amdMicrocodeHeaderValid(ucodeHeader)) {
+            continue;
+        }
+
+        UModelIndex microcodeIndex;
+        if (parseAmdMicrocodeHeader(body.mid(offset), offset, index.parent(), microcodeIndex) == U_SUCCESS) {
+            // We might find several microcode items in body, so keep scanning
+            status = U_SUCCESS;
+        }
+    }
+
+    return status;
+}
+
+USTATUS FfsParser::parseAmdMicrocodeHeader(const UByteArray & microcode, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index)
+{
+    // We have enough data to fit the header
+    if ((UINT32)microcode.size() < sizeof(AMD_MICROCODE_HEADER)) {
+        return U_INVALID_MICROCODE;
+    }
+
+    const AMD_MICROCODE_HEADER* ucodeHeader = (const AMD_MICROCODE_HEADER*)microcode.constData();
+
+    if (!amdMicrocodeHeaderValid(ucodeHeader)) {
+        return U_INVALID_MICROCODE;
+    }
+
+    // We have enough data to fit the whole TotalSize
+    UINT32 microcodeSize = amdMicrocodeGetSize(ucodeHeader);
+    if ((UINT32)microcode.size() < microcodeSize) {
+        return U_INVALID_MICROCODE;
+    }
+
+    // Add info
+    UString name("AMD microcode");
+    UString info = usprintf("Date: %02X.%02X.%04x\nCPU signature: %08Xh\nRevision: %08Xh",
+                            amdMicrocodeGetDay(ucodeHeader),
+                            amdMicrocodeGetMonth(ucodeHeader),
+                            amdMicrocodeGetYear(ucodeHeader),
+                            ucodeHeader->ProcessorSignature,
+                            ucodeHeader->UpdateRevision);
+
+    // Add tree item
+    index = model->addItem(localOffset, Types::AmdMicrocode, 0, name, UString(), info, UByteArray(), microcode, UByteArray(), Fixed, parent);
+
+    // No need to parse the body further for now
+    return U_SUCCESS;
+}
+
+UString FfsParser::getMeVersionFromPartition(const UByteArray & partition)
+{
+    // Search for new signature
+    UINT32 mn2Sig = ME_VERSION_SIGNATURE2; // $MN2
+    UByteArray sig2((const char*)&mn2Sig, sizeof(mn2Sig));
+    INT32 vOff = (INT32)partition.indexOf(sig2);
+    if (vOff < 0) { // No $MN2 in this partition
+        // Search for old signature
+        UINT32 manSig = ME_VERSION_SIGNATURE; // $MAN
+        UByteArray sig((const char*)&manSig, sizeof(manSig));
+        vOff = (INT32)partition.indexOf(sig);
+        if (vOff < 0) { // No $MAN in this partition
+            return UString("");
+        }
+    }
+    
+    if ((UINT32)vOff + sizeof(ME_VERSION) > (UINT32)partition.size())
+        return UString(""); // Not enough data
+
+    const ME_VERSION* ver = (const ME_VERSION*)(partition.constData() + vOff);
+    return usprintf("%u.%u.%u.%u", ver->Major, ver->Minor, ver->Bugfix, ver->Build);
+}
+
+USTATUS FfsParser::parseBpdtRegion(const UByteArray & region, const UINT32 localOffset, const UINT32 sbpdtOffsetFixup, const UModelIndex & parent, UModelIndex & index, UString & meVersion)
+{
+    UINT32 regionSize = (UINT32)region.size();
+    
+    // Check region size
+    if (regionSize < sizeof(BPDT_HEADER)) {
+        msg(usprintf("%s: BPDT region too small to fit BPDT partition table header", __FUNCTION__), parent);
+        return U_INVALID_ME_PARTITION_TABLE;
+    }
+    
+    // Populate partition table header
+    const BPDT_HEADER* ptHeader = (const BPDT_HEADER*)(region.constData());
+    
+    // Check numEntries to be sane
+    if (ptHeader->NumEntries >= 0x100) {
+        msg(usprintf("%s: too many BPDT partition table entries", __FUNCTION__), parent);
+        return U_INVALID_ME_PARTITION_TABLE;
+    }
+    
+    // Check region size again
+    UINT32 ptBodySize = ptHeader->NumEntries * sizeof(BPDT_ENTRY);
+    UINT32 ptSize = sizeof(BPDT_HEADER) + ptBodySize;
+    if (regionSize < ptSize) {
+        msg(usprintf("%s: BPDT region too small to fit BPDT partition table", __FUNCTION__), parent);
+        return U_INVALID_ME_PARTITION_TABLE;
+    }
+    
+    // Get info
+    UByteArray header = region.left(sizeof(BPDT_HEADER));
+    UByteArray body = region.mid(sizeof(BPDT_HEADER), ptBodySize);
+    
+    UString name = UString("BPDT partition table");
+    UString info = usprintf("Number of entries: %u\nVersion: %02Xh\nRedundancyFlag: %Xh\n"
+                            "IFWI version: %Xh\nFITC version: %u.%u.%u.%u",
+                            ptHeader->NumEntries,
+                            ptHeader->HeaderVersion,
+                            ptHeader->RedundancyFlag,
+                            ptHeader->IfwiVersion,
+                            ptHeader->FitcMajor, ptHeader->FitcMinor, ptHeader->FitcHotfix, ptHeader->FitcBuild);
+    
+    // Add tree item
+    index = model->addItem(localOffset, Types::BpdtStore, 0, name, UString(), info, header, body, UByteArray(), Fixed, parent);
+    
+    // Adjust offset
+    UINT32 offset = sizeof(BPDT_HEADER);
+    
+    // Add partition table entries
+    std::vector<BPDT_PARTITION_INFO> partitions;
+    const BPDT_ENTRY* firstPtEntry = (const BPDT_ENTRY*)((const UINT8*)ptHeader + sizeof(BPDT_HEADER));
+    UINT16 numEntries = ptHeader->NumEntries;
+    for (UINT16 i = 0; i < numEntries; i++) {
+        // Populate entry header
+        const BPDT_ENTRY* ptEntry = firstPtEntry + i;
+        
+        // Get info
+        name = bpdtEntryTypeToUString(ptEntry->Type);
+        info = usprintf("Type: %Xh\nPartition offset: %Xh\nPartition length: %Xh",
+                        ptEntry->Type,
+                        ptEntry->Offset,
+                        ptEntry->Size) +
+        UString("\nSplit sub-partition first part: ") + (ptEntry->SplitSubPartitionFirstPart ? "Yes" : "No") +
+        UString("\nSplit sub-partition second part: ") + (ptEntry->SplitSubPartitionSecondPart ? "Yes" : "No") +
+        UString("\nCode sub-partition: ") + (ptEntry->CodeSubPartition ? "Yes" : "No") +
+        UString("\nUMA cacheable: ") + (ptEntry->UmaCacheable ? "Yes" : "No");
         
         // Add tree item
-        model->addItem(type, subtype, name, QString(), info, QByteArray(), padding, QByteArray(), true, parsingDataToQByteArray(pdata), index);
-    }
-
-    // Parse bodies
-    for (int i = 0; i < model->rowCount(index); i++) {
-        QModelIndex current = index.child(i, 0);
-        switch (model->type(current)) {
-        case Types::VssStore:
-        case Types::FdcStore:       parseVssStoreBody(current);  break;
-        case Types::FsysStore:      parseFsysStoreBody(current); break;
-        case Types::EvsaStore:      parseEvsaStoreBody(current); break;
-        case Types::FlashMapStore:  parseFlashMapBody(current);  break;
+        UModelIndex entryIndex = model->addItem(localOffset + offset, Types::BpdtEntry, 0, name, UString(), info, UByteArray(), UByteArray((const char*)ptEntry, sizeof(BPDT_ENTRY)), UByteArray(), Fixed, index);
+        
+        // Adjust offset
+        offset += sizeof(BPDT_ENTRY);
+        
+        if (ptEntry->Offset != 0 && ptEntry->Offset != 0xFFFFFFFF && ptEntry->Size != 0) {
+            // Add to partitions vector
+            BPDT_PARTITION_INFO partition = {};
+            partition.type = Types::BpdtPartition;
+            partition.ptEntry = *ptEntry;
+            partition.ptEntry.Offset -= sbpdtOffsetFixup;
+            partition.index = entryIndex;
+            partitions.push_back(partition);
         }
     }
     
-    return ERR_SUCCESS;
-}
-
-STATUS FfsParser::findNextStore(const QModelIndex & index, const QByteArray & volume, const UINT32 parentOffset, const UINT32 storeOffset, UINT32 & nextStoreOffset)
-{
-    UINT32 dataSize = volume.size();
-
-    if (dataSize < sizeof(UINT32))
-        return ERR_STORES_NOT_FOUND;
-
-    UINT32 offset = storeOffset;
-    for (; offset < dataSize - sizeof(UINT32); offset++) {
-        const UINT32* currentPos = (const UINT32*)(volume.constData() + offset);
-        if (*currentPos == NVRAM_VSS_STORE_SIGNATURE || *currentPos == NVRAM_APPLE_SVS_STORE_SIGNATURE) { //$VSS or $SVS signatures found, perform checks
-            const VSS_VARIABLE_STORE_HEADER* vssHeader = (const VSS_VARIABLE_STORE_HEADER*)currentPos;
-            if (vssHeader->Format != NVRAM_VSS_VARIABLE_STORE_FORMATTED) {
-                msg(QObject::tr("findNextStore: VSS store candidate at offset %1h skipped, has invalid format %2h").hexarg(parentOffset + offset).hexarg2(vssHeader->Format, 2), index);
-                continue;
+    // Check for empty set of partitions
+    if (partitions.empty()) {
+        // Add a single padding partition in this case
+        BPDT_PARTITION_INFO padding = {};
+        padding.ptEntry.Offset = offset;
+        padding.ptEntry.Size = (UINT32)(region.size() - padding.ptEntry.Offset);
+        padding.type = Types::Padding;
+        partitions.push_back(padding);
+    }
+    
+make_partition_table_consistent:
+    if (partitions.empty()) {
+        return U_INVALID_ME_PARTITION_TABLE;
+    }
+    // Sort partitions by offset
+    std::sort(partitions.begin(), partitions.end());
+    
+    // Check for intersections and paddings between partitions
+    BPDT_PARTITION_INFO padding = {};
+    
+    // Check intersection with the partition table header
+    if (partitions.front().ptEntry.Offset < ptSize) {
+        msg(usprintf("%s: BPDT partition has intersection with BPDT partition table, skipped", __FUNCTION__),
+            partitions.front().index);
+        partitions.erase(partitions.begin());
+        goto make_partition_table_consistent;
+    }
+    // Check for padding between partition table and the first partition
+    else if (partitions.front().ptEntry.Offset > ptSize) {
+        padding.ptEntry.Offset = ptSize;
+        padding.ptEntry.Size = partitions.front().ptEntry.Offset - padding.ptEntry.Offset;
+        padding.type = Types::Padding;
+        partitions.insert(partitions.begin(), padding);
+    }
+    // Check for intersections/paddings between partitions
+    for (size_t i = 1; i < partitions.size(); i++) {
+        UINT32 previousPartitionEnd = partitions[i - 1].ptEntry.Offset + partitions[i - 1].ptEntry.Size;
+        
+        // Check that partition is fully present in the image
+        if ((UINT64)partitions[i].ptEntry.Offset + (UINT64)partitions[i].ptEntry.Size > regionSize) {
+            if ((UINT64)partitions[i].ptEntry.Offset >= (UINT64)region.size()) {
+                msg(usprintf("%s: BPDT partition is located outside of the opened image, skipped", __FUNCTION__), partitions[i].index);
+                partitions.erase(partitions.begin() + i);
+                goto make_partition_table_consistent;
             }
-            if (vssHeader->Size == 0 || vssHeader->Size == 0xFFFFFFFF) {
-                msg(QObject::tr("findNextStore: VSS store candidate at offset %1h skipped, has invalid size %2h").hexarg(parentOffset + offset).hexarg2(vssHeader->Size, 8), index);
-                continue;
+            else {
+                msg(usprintf("%s: BPDT partition can't fit into its region, truncated", __FUNCTION__), partitions[i].index);
+                partitions[i].ptEntry.Size = regionSize - (UINT32)partitions[i].ptEntry.Offset;
             }
-            // All checks passed, store found
-            break;
         }
-        else if (*currentPos == NVRAM_FDC_VOLUME_SIGNATURE) { //FDC signature found
-            const FDC_VOLUME_HEADER* fdcHeader = (const FDC_VOLUME_HEADER*)currentPos;
-            if (fdcHeader->Size == 0 || fdcHeader->Size == 0xFFFFFFFF) {
-                msg(QObject::tr("findNextStore: FDC store candidate at offset %1h skipped, has invalid size %2h").hexarg(parentOffset + offset).hexarg2(fdcHeader->Size, 8), index);
-                continue;
+        
+        // Check for intersection with previous partition
+        if (partitions[i].ptEntry.Offset < previousPartitionEnd) {
+            // Check if current partition is located inside previous one
+            if (partitions[i].ptEntry.Offset + partitions[i].ptEntry.Size <= previousPartitionEnd) {
+                msg(usprintf("%s: BPDT partition is located inside another BPDT partition, skipped", __FUNCTION__),
+                    partitions[i].index);
+                partitions.erase(partitions.begin() + i);
+                goto make_partition_table_consistent;
             }
-            // All checks passed, store found
-            break;
-        }
-        else if (*currentPos == NVRAM_APPLE_FSYS_STORE_SIGNATURE || *currentPos == NVRAM_APPLE_GAID_STORE_SIGNATURE) { //Fsys or Gaid signature found
-            const APPLE_FSYS_STORE_HEADER* fsysHeader = (const APPLE_FSYS_STORE_HEADER*)currentPos;
-            if (fsysHeader->Size == 0 || fsysHeader->Size == 0xFFFF) {
-                msg(QObject::tr("findNextStore: Fsys store candidate at offset %1h skipped, has invalid size %2h").hexarg(parentOffset + offset).hexarg2(fsysHeader->Size, 4), index);
-                continue;
+            else {
+                msg(usprintf("%s: BPDT partition intersects with previous one, skipped", __FUNCTION__),
+                    partitions[i].index);
+                partitions.erase(partitions.begin() + i);
+                goto make_partition_table_consistent;
             }
-            // All checks passed, store found
-            break;
         }
-        else if (*currentPos == NVRAM_EVSA_STORE_SIGNATURE) { //EVSA signature found
-            if (offset < sizeof(UINT32))
-                continue;
-
-            const EVSA_STORE_ENTRY* evsaHeader = (const EVSA_STORE_ENTRY*)(currentPos - 1);
-            if (evsaHeader->Header.Type != NVRAM_EVSA_ENTRY_TYPE_STORE) {
-                msg(QObject::tr("findNextStore: EVSA store candidate at offset %1h skipped, has invalid type %2h").hexarg(parentOffset + offset - 4).hexarg2(evsaHeader->Header.Type, 2), index);
-                continue;
-            }
-            if (evsaHeader->StoreSize == 0 || evsaHeader->StoreSize == 0xFFFFFFFF) {
-                msg(QObject::tr("findNextStore: EVSA store candidate at offset %1h skipped, has invalid size %2h").hexarg(parentOffset + offset).hexarg2(evsaHeader->StoreSize, 8), index);
-                continue;
-            }
-            // All checks passed, store found
-            offset -= sizeof(UINT32);
-            break;
+        
+        // Check for padding between current and previous partitions
+        else if (partitions[i].ptEntry.Offset > previousPartitionEnd) {
+            padding.ptEntry.Offset = previousPartitionEnd;
+            padding.ptEntry.Size = partitions[i].ptEntry.Offset - previousPartitionEnd;
+            padding.type = Types::Padding;
+            std::vector<BPDT_PARTITION_INFO>::iterator iter = partitions.begin();
+            std::advance(iter, i);
+            partitions.insert(iter, padding);
         }
-        else if (*currentPos == NVRAM_MAIN_STORE_VOLUME_GUID_DATA1 || *currentPos == EDKII_WORKING_BLOCK_SIGNATURE_GUID_DATA1) { //Possible FTW block signature found
-            QByteArray guid = QByteArray(volume.constData() + offset, sizeof(EFI_GUID));
-            if (guid != NVRAM_MAIN_STORE_VOLUME_GUID && guid != EDKII_WORKING_BLOCK_SIGNATURE_GUID) // Check the whole signature
-                continue;
-
-            // Detect header variant based on WriteQueueSize
-            const EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER32* ftwHeader = (const EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER32*)currentPos;
-            if (ftwHeader->WriteQueueSize % 0x10 == 0x04) { // Header with 32 bit WriteQueueSize
-                if (ftwHeader->WriteQueueSize == 0 || ftwHeader->WriteQueueSize == 0xFFFFFFFF) {
-                    msg(QObject::tr("findNextStore: FTW block candidate at offset %1h skipped, has invalid body size %2h").hexarg(parentOffset + offset).hexarg2(ftwHeader->WriteQueueSize, 8), index);
-                    continue;
-                }
-            }
-            else if (ftwHeader->WriteQueueSize % 0x10 == 0x00) { // Header with 64 bit WriteQueueSize
-                const EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER64* ftw64Header = (const EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER64*)currentPos;
-                if (ftw64Header->WriteQueueSize == 0 || ftw64Header->WriteQueueSize >= 0xFFFFFFFF) {
-                    msg(QObject::tr("findNextStore: FTW block candidate at offset %1h skipped, has invalid body size %2h").hexarg(parentOffset + offset).hexarg2(ftw64Header->WriteQueueSize, 16), index);
-                    continue;
-                }
-            }
-            else // Unknown header
-                continue;
-
-            // All checks passed, store found
-            break;
-        }
-        else if (*currentPos == NVRAM_PHOENIX_FLASH_MAP_SIGNATURE_PART1) {// Phoenix SCT flash map
-            QByteArray signature = QByteArray(volume.constData() + offset, NVRAM_PHOENIX_FLASH_MAP_SIGNATURE_LENGTH);
-            if (signature != NVRAM_PHOENIX_FLASH_MAP_SIGNATURE) // Check the whole signature
-                continue;
-
-            // All checks passed, store found
-            break;
-        }
-        else if (*currentPos == NVRAM_PHOENIX_CMDB_HEADER_SIGNATURE) { // Phoenix SCT CMDB store
-            const PHOENIX_CMDB_HEADER* cmdbHeader = (const PHOENIX_CMDB_HEADER*)currentPos;
-
-            // Check size
-            if (cmdbHeader->HeaderSize != sizeof(PHOENIX_CMDB_HEADER))
-                continue;
-
-            // All checks passed, store found
-            break;
-        }
-        else if (*currentPos == INTEL_MICROCODE_HEADER_VERSION) {// Intel microcode
-            if (!INTEL_MICROCODE_HEADER_SIZES_VALID(currentPos)) // Check header sizes
-                continue;
-
-            // Check reserved bytes
-            const INTEL_MICROCODE_HEADER* ucodeHeader = (const INTEL_MICROCODE_HEADER*)currentPos;
-            bool reservedBytesValid = true;
-            for (UINT32 i = 0; i < sizeof(ucodeHeader->Reserved); i++)
-                if (ucodeHeader->Reserved[i] != INTEL_MICROCODE_HEADER_RESERVED_BYTE) {
-                    reservedBytesValid = false;
-                    break;
-                }
-            if (!reservedBytesValid)
-                continue;
-
-            // All checks passed, store found
-            break;
-        }
-        else if (*currentPos == OEM_ACTIVATION_PUBKEY_MAGIC) { // SLIC pubkey
-            if (offset < 4 * sizeof(UINT32))
-                continue;
-
-            const OEM_ACTIVATION_PUBKEY* pubkeyHeader = (const OEM_ACTIVATION_PUBKEY*)(currentPos - 4);
-            // Check type
-            if (pubkeyHeader->Type != OEM_ACTIVATION_PUBKEY_TYPE)
-                continue;
-
-            // All checks passed, store found
-            offset -= 4 * sizeof(UINT32);
-            break;
-        }
-        else if (*currentPos == OEM_ACTIVATION_MARKER_WINDOWS_FLAG_PART1) { // SLIC marker
-            if (offset >= dataSize - sizeof(UINT64) || 
-                *(const UINT64*)currentPos != OEM_ACTIVATION_MARKER_WINDOWS_FLAG ||
-                offset < 26) // Check full windows flag and structure size
-                continue;
+    }
+    // Check for padding after the last region
+    if ((UINT32)partitions.back().ptEntry.Offset + (UINT32)partitions.back().ptEntry.Size < regionSize) {
+        padding.ptEntry.Offset = partitions.back().ptEntry.Offset + partitions.back().ptEntry.Size;
+        padding.ptEntry.Size = (UINT32)(regionSize - padding.ptEntry.Offset);
+        padding.type = Types::Padding;
+        partitions.push_back(padding);
+    }
+    
+    // Partition map is consistent
+    for (size_t i = 0; i < partitions.size(); i++) {
+        if (partitions[i].type == Types::BpdtPartition) {
+            // Get info
+            UString name = bpdtEntryTypeToUString(partitions[i].ptEntry.Type);
+            UByteArray partition = region.mid(partitions[i].ptEntry.Offset, partitions[i].ptEntry.Size);
+            UByteArray signature = partition.left(sizeof(UINT32));
             
-            const OEM_ACTIVATION_MARKER* markerHeader = (const OEM_ACTIVATION_MARKER*)(volume.constData() + offset - 26);
-            // Check reserved bytes
-            bool reservedBytesValid = true;
-            for (UINT32 i = 0; i < sizeof(markerHeader->Reserved); i++)
-                if (markerHeader->Reserved[i] != OEM_ACTIVATION_MARKER_RESERVED_BYTE) {
-                    reservedBytesValid = false;
-                    break;
+            UString info = usprintf("Type: %Xh", partitions[i].ptEntry.Type) +
+            UString("\nSplit sub-partition first part: ") + (partitions[i].ptEntry.SplitSubPartitionFirstPart ? "Yes" : "No") +
+            UString("\nSplit sub-partition second part: ") + (partitions[i].ptEntry.SplitSubPartitionSecondPart ? "Yes" : "No") +
+            UString("\nCode sub-partition: ") + (partitions[i].ptEntry.CodeSubPartition ? "Yes" : "No") +
+            UString("\nUMA cacheable: ") + (partitions[i].ptEntry.UmaCacheable ? "Yes" : "No");
+            
+            UString text = name;
+            
+            // Add tree item
+            UModelIndex partitionIndex = model->addItem(localOffset + partitions[i].ptEntry.Offset, Types::BpdtPartition, 0, name, text, info, UByteArray(), partition, UByteArray(), Fixed, parent);
+            
+            // Populate ME version from FTPR partition
+            if (partitions[i].ptEntry.Type == BPDT_ENTRY_TYPE_FTPR) {
+                meVersion = getMeVersionFromPartition(partition);
+            }
+            
+            // Special case of S-BPDT
+            if (partitions[i].ptEntry.Type == BPDT_ENTRY_TYPE_S_BPDT) {
+                UModelIndex sbpdtIndex;
+                UString meVersion;
+                parseBpdtRegion(partition, 0, partitions[i].ptEntry.Offset, partitionIndex, sbpdtIndex, meVersion); // Third parameter is a fixup for S-BPDT offset entries, because they are calculated from the start of BIOS region
+            }
+            
+            // Parse code partitions
+            if (readUnaligned((const UINT32*)partition.constData()) == CPD_SIGNATURE) {
+                // Parse code partition contents
+                UModelIndex cpdIndex;
+                parseCpdRegion(partition, 0, partitionIndex, cpdIndex);
+            }
+            
+            // Check for entry type to be known
+            if (partitions[i].ptEntry.Type > BPDT_ENTRY_TYPE_EFWP && partitions[i].ptEntry.Type != BPDT_ENTRY_TYPE_ADSP) {
+                msg(usprintf("%s: BPDT entry of unknown type found", __FUNCTION__), partitionIndex);
+            }
+        }
+        else if (partitions[i].type == Types::Padding) {
+            UByteArray padding = region.mid(partitions[i].ptEntry.Offset, partitions[i].ptEntry.Size);
+            
+            // Get info
+            name = UString("Padding");
+            
+            // Add tree item
+            model->addItem(localOffset + partitions[i].ptEntry.Offset, Types::Padding, getPaddingType(padding), name, UString(), UString(), UByteArray(), padding, UByteArray(), Fixed, parent);
+        }
+    }
+    
+    // Try getting ME version from RBEP partition if it's still not found
+    if (meVersion.isEmpty()) {
+        for (size_t i = 0; i < partitions.size(); i++) {
+            if (partitions[i].type == Types::BpdtPartition) {
+                // Populate ME version from RBEP partition
+                if (partitions[i].ptEntry.Type == BPDT_ENTRY_TYPE_RBEP) {
+                    UByteArray partition = region.mid(partitions[i].ptEntry.Offset, partitions[i].ptEntry.Size);
+                    meVersion = getMeVersionFromPartition(partition);
                 }
-            if (!reservedBytesValid)
-                continue;
+            }
+        }
+    }
+    
+    return U_SUCCESS;
+}
 
-            // All checks passed, store found
-            offset -= 26;
+USTATUS FfsParser::parseCpdRegion(const UByteArray & region, const UINT32 localOffset, const UModelIndex & parent, UModelIndex & index)
+{
+    // Check directory size
+    if ((UINT32)region.size() < sizeof(CPD_REV1_HEADER)) {
+        msg(usprintf("%s: CPD too small to fit rev1 partition table header", __FUNCTION__), parent);
+        return U_INVALID_ME_PARTITION_TABLE;
+    }
+    
+    // Populate partition table header
+    const CPD_REV1_HEADER* cpdHeader = (const CPD_REV1_HEADER*)region.constData();
+    
+    // Check header version to be known
+    UINT32 ptHeaderSize = 0;
+    if (cpdHeader->HeaderVersion == 2) {
+        if ((UINT32)region.size() < sizeof(CPD_REV2_HEADER)) {
+            msg(usprintf("%s: CPD too small to fit rev2 partition table header", __FUNCTION__), parent);
+            return U_INVALID_ME_PARTITION_TABLE;
+        }
+        
+        ptHeaderSize = sizeof(CPD_REV2_HEADER);
+    }
+    else if (cpdHeader->HeaderVersion == 1) {
+        ptHeaderSize = sizeof(CPD_REV1_HEADER);
+    }
+    
+    // Check directory size again
+    UINT32 ptBodySize = cpdHeader->NumEntries * sizeof(CPD_ENTRY);
+    UINT32 ptSize = ptHeaderSize + ptBodySize;
+    if ((UINT32)region.size() < ptSize) {
+        msg(usprintf("%s: CPD too small to fit the whole partition table", __FUNCTION__), parent);
+        return U_INVALID_ME_PARTITION_TABLE;
+    }
+    
+    // Get info
+    UByteArray header = region.left(ptHeaderSize);
+    UByteArray body = region.mid(ptHeaderSize, ptBodySize);
+    UString name = usprintf("CPD partition table");
+    UString info = usprintf("Number of entries: %u\nHeader version: %u\nEntry version: %u",
+                            cpdHeader->NumEntries,
+                            cpdHeader->HeaderVersion,
+                            cpdHeader->EntryVersion);
+    
+    // Add tree item
+    index = model->addItem(localOffset, Types::CpdStore, 0, name, UString(), info, header, body, UByteArray(), Fixed, parent);
+    
+    // Add partition table entries
+    std::vector<CPD_PARTITION_INFO> partitions;
+    UINT32 offset = ptHeaderSize;
+    const CPD_ENTRY* firstCpdEntry = (const CPD_ENTRY*)(body.constData());
+
+    if (cpdHeader->NumEntries * sizeof(CPD_ENTRY) > (UINT32)body.size()) {
+        return U_INVALID_ME_PARTITION_TABLE;
+    }
+
+    for (UINT32 i = 0; i < cpdHeader->NumEntries; i++) {
+        // Populate entry header
+        const CPD_ENTRY* cpdEntry = firstCpdEntry + i;
+        UByteArray entry((const char*)cpdEntry, sizeof(CPD_ENTRY));
+        
+        // Get info
+        name = usprintf("%.12s", cpdEntry->EntryName);
+        info = usprintf("Entry offset: %Xh\nEntry length: %Xh\nHuffman compressed: ",
+                        cpdEntry->Offset.Offset,
+                        cpdEntry->Length)
+        + (cpdEntry->Offset.HuffmanCompressed ? "Yes" : "No");
+        
+        // Add tree item
+        UModelIndex entryIndex = model->addItem(offset, Types::CpdEntry, 0, name, UString(), info, UByteArray(), entry, UByteArray(), Fixed, index);
+        
+        // Adjust offset
+        offset += sizeof(CPD_ENTRY);
+        
+        if (cpdEntry->Offset.Offset != 0 && cpdEntry->Length != 0) {
+            // Add to partitions vector
+            CPD_PARTITION_INFO partition;
+            partition.type = Types::CpdPartition;
+            partition.ptEntry = *cpdEntry;
+            partition.index = entryIndex;
+            partition.hasMetaData = false;
+            partitions.push_back(partition);
+        }
+    }
+    
+    // Add padding if there's no partions to add
+    if (partitions.size() == 0) {
+        UByteArray partition = region.mid(ptSize);
+        
+        // Get info
+        name = UString("Padding");
+
+        // Add tree item
+        model->addItem(localOffset + ptSize, Types::Padding, getPaddingType(partition), name, UString(), UString(), UByteArray(), partition, UByteArray(), Fixed, parent);
+        
+        return U_SUCCESS;
+    }
+    
+    // Sort partitions by offset
+    std::sort(partitions.begin(), partitions.end());
+    
+    // Because lengths for all Huffmann-compressed partitions mean nothing at all, we need to split all partitions into 2 classes:
+    // 1. CPD manifest
+    // 2. Metadata entries
+    UINT32 i = 1; // manifest is index 0, .met partitions start at index 1
+    while (i < partitions.size()) {
+        name = usprintf("%.12s", partitions[i].ptEntry.EntryName);
+        
+        // Check if the current entry is metadata entry
+        if (!name.endsWith(".met")) {
+            // No need to parse further, all metadata partitions are parsed
             break;
         }
-    }
-    // No more stores found
-    if (offset >= dataSize - sizeof(UINT32))
-        return ERR_STORES_NOT_FOUND;
+        
+        // Parse into data block, find Module Attributes extension, and get compressed size from there
+        UINT32 offset = 0;
+        UINT32 length = 0xFFFFFFFF; // Special guardian value
 
-    nextStoreOffset = offset;
-
-    return ERR_SUCCESS;
-}
-
-STATUS FfsParser::getStoreSize(const QByteArray & data, const UINT32 storeOffset, UINT32 & storeSize)
-{
-    const UINT32* signature = (const UINT32*)(data.constData() + storeOffset);
-    if (*signature == NVRAM_VSS_STORE_SIGNATURE || *signature == NVRAM_APPLE_SVS_STORE_SIGNATURE) {
-        const VSS_VARIABLE_STORE_HEADER* vssHeader = (const VSS_VARIABLE_STORE_HEADER*)signature;
-        storeSize = vssHeader->Size;
-    }
-    else if (*signature == NVRAM_FDC_VOLUME_SIGNATURE) {
-        const FDC_VOLUME_HEADER* fdcHeader = (const FDC_VOLUME_HEADER*)signature;
-        storeSize = fdcHeader->Size;
-    }
-    else if (*signature == NVRAM_APPLE_FSYS_STORE_SIGNATURE || *signature == NVRAM_APPLE_GAID_STORE_SIGNATURE) {
-        const APPLE_FSYS_STORE_HEADER* fsysHeader = (const APPLE_FSYS_STORE_HEADER*)signature;
-        storeSize = fsysHeader->Size;
-    }
-    else if (*(signature + 1) == NVRAM_EVSA_STORE_SIGNATURE) {
-        const EVSA_STORE_ENTRY* evsaHeader = (const EVSA_STORE_ENTRY*)signature;
-        storeSize = evsaHeader->StoreSize;
-    }
-    else if (*signature == NVRAM_MAIN_STORE_VOLUME_GUID_DATA1 || *signature == EDKII_WORKING_BLOCK_SIGNATURE_GUID_DATA1) {
-        const EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER32* ftwHeader = (const EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER32*)signature;
-        if (ftwHeader->WriteQueueSize % 0x10 == 0x04) { // Header with 32 bit WriteQueueSize
-            storeSize = sizeof(EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER32) + ftwHeader->WriteQueueSize;
+        if (region.size() <= partitions[i].ptEntry.Offset.Offset) {
+            break;
         }
-        else { //  Header with 64 bit WriteQueueSize
-            const EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER64* ftw64Header = (const EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER64*)signature;
-            storeSize = sizeof(EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER64) + ftw64Header->WriteQueueSize;
-        }
-    }
-    else if (*signature == NVRAM_PHOENIX_FLASH_MAP_SIGNATURE_PART1) { // Phoenix SCT flash map
-        const PHOENIX_FLASH_MAP_HEADER* flashMapHeader = (const PHOENIX_FLASH_MAP_HEADER*)signature;
-        storeSize = sizeof(PHOENIX_FLASH_MAP_HEADER) + sizeof(PHOENIX_FLASH_MAP_ENTRY) * flashMapHeader->NumEntries;
-    }
-    else if (*signature == NVRAM_PHOENIX_CMDB_HEADER_SIGNATURE) { // Phoenix SCT CMDB store
-        storeSize = NVRAM_PHOENIX_CMDB_SIZE; // It's a predefined max size, no need to calculate
-    }
-    else if (*(signature + 4) == OEM_ACTIVATION_PUBKEY_MAGIC) { // SLIC pubkey
-        const OEM_ACTIVATION_PUBKEY* pubkeyHeader = (const OEM_ACTIVATION_PUBKEY*)signature;
-        storeSize = pubkeyHeader->Size;
-    }
-    else if (*(const UINT64*)(data.constData() + storeOffset + 26) == OEM_ACTIVATION_MARKER_WINDOWS_FLAG) { // SLIC marker
-        const OEM_ACTIVATION_MARKER* markerHeader = (const OEM_ACTIVATION_MARKER*)signature;
-        storeSize = markerHeader->Size;
-    }
-    else if (*signature == INTEL_MICROCODE_HEADER_VERSION) { // Intel microcode, must be checked after SLIC marker because of the same *signature values
-        const INTEL_MICROCODE_HEADER* ucodeHeader = (const INTEL_MICROCODE_HEADER*)signature;
-        storeSize = ucodeHeader->TotalSize;
-    }
-    return ERR_SUCCESS;
-}
 
-STATUS FfsParser::parseVssStoreHeader(const QByteArray & store, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
-{
-    const UINT32 dataSize = (const UINT32)store.size();
+        UByteArray partition = region.mid(partitions[i].ptEntry.Offset.Offset, partitions[i].ptEntry.Length);
+        while (offset < ((UINT32)partition.size() - sizeof(CPD_EXTENTION_HEADER))) {
+            const CPD_EXTENTION_HEADER* extHeader = (const CPD_EXTENTION_HEADER*) (partition.constData() + offset);
+            if (extHeader->Length && extHeader->Length <= ((UINT32)partition.size() - offset)) {
+                if (extHeader->Type == CPD_EXT_TYPE_MODULE_ATTRIBUTES) {
+                    const CPD_EXT_MODULE_ATTRIBUTES* attrHeader = (const CPD_EXT_MODULE_ATTRIBUTES*)(partition.constData() + offset);
+                    length = attrHeader->CompressedSize;
+                }
+                offset += extHeader->Length;
+            }
+            else break;
+        }
+        
+        // Search down for corresponding code partition
+        // Construct its name by removing the .met suffix
+        name.chop(4);
+        
+        // Search
+        bool found = false;
+        UINT32 j = 1;
+        while (j < partitions.size()) {
+            UString namej = usprintf("%.12s", partitions[j].ptEntry.EntryName);
+            
+            if (name == namej) {
+                found = true;
+                // Found it, update its Length if needed
+                if (partitions[j].ptEntry.Offset.HuffmanCompressed) {
+                    partitions[j].ptEntry.Length = length;
+                }
+                else if (length != 0xFFFFFFFF && partitions[j].ptEntry.Length != length) {
+                    msg(usprintf("%s: partition size mismatch between partition table (%Xh) and partition metadata (%Xh)", __FUNCTION__,
+                                 partitions[j].ptEntry.Length, length), partitions[j].index);
+                    partitions[j].ptEntry.Length = length; // Believe metadata
+                }
+                partitions[j].hasMetaData = true;
+                // No need to search further
+                break;
+            }
+            // Check the next partition
+            j++;
+        }
+        if (!found) {
+            msg(usprintf("%s: no code partition", __FUNCTION__), partitions[i].index);
+        }
+        
+        // Check the next partition
+        i++;
+    }
     
-    // Check store size
-    if (dataSize < sizeof(VSS_VARIABLE_STORE_HEADER)) {
-        msg(QObject::tr("parseVssStoreHeader: volume body is too small even for VSS store header"), parent);
-        return ERR_SUCCESS;
+make_partition_table_consistent:
+    if (partitions.empty()) {
+        return U_INVALID_ME_PARTITION_TABLE;
     }
-
-    // Get VSS store header
-    const VSS_VARIABLE_STORE_HEADER* vssStoreHeader = (const VSS_VARIABLE_STORE_HEADER*)store.constData();
-
-    // Check store size
-    if (dataSize < vssStoreHeader->Size) {
-        msg(QObject::tr("parseVssStoreHeader: VSS store size %1h (%2) is greater than volume body size %3h (%4)")
-            .hexarg(vssStoreHeader->Size).arg(vssStoreHeader->Size)
-            .hexarg(dataSize).arg(dataSize), parent);
-        return ERR_SUCCESS;
+    // Sort partitions by offset
+    std::sort(partitions.begin(), partitions.end());
+    
+    // Check for intersections and paddings between partitions
+    CPD_PARTITION_INFO padding = {};
+    
+    // Check intersection with the partition table header
+    if (partitions.front().ptEntry.Offset.Offset < ptSize) {
+        msg(usprintf("%s: CPD partition has intersection with CPD partition table, skipped", __FUNCTION__),
+            partitions.front().index);
+        partitions.erase(partitions.begin());
+        goto make_partition_table_consistent;
     }
-
-    // Get parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
-    // Construct header and body
-    QByteArray header = store.left(sizeof(VSS_VARIABLE_STORE_HEADER));
-    QByteArray body = store.mid(sizeof(VSS_VARIABLE_STORE_HEADER), vssStoreHeader->Size - sizeof(VSS_VARIABLE_STORE_HEADER));
-
-    // Add info
-    bool isSvsStore = (vssStoreHeader->Signature == NVRAM_APPLE_SVS_STORE_SIGNATURE);
-    QString name = isSvsStore ? QObject::tr("SVS store") : QObject::tr("VSS store");
-    QString info = QObject::tr("Signature: %1\nFull size: %2h (%3)\nHeader size: %4h (%5)\nBody size: %6h (%7)\nFormat: %8h\nState: %9h\nUnknown: %10h")
-        .arg(isSvsStore ? QObject::tr("$SVS") : QObject::tr("$VSS"))
-        .hexarg(vssStoreHeader->Size).arg(vssStoreHeader->Size)
-        .hexarg(header.size()).arg(header.size())
-        .hexarg(body.size()).arg(body.size())
-        .hexarg2(vssStoreHeader->Format, 2)
-        .hexarg2(vssStoreHeader->State, 2)
-        .hexarg2(vssStoreHeader->Unknown, 4);
-
-    // Add correct offset
-    pdata.offset = parentOffset;
-
-    // Add tree item
-    index = model->addItem(Types::VssStore, 0, name, QString(), info, header, body, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
-    return ERR_SUCCESS;
+    // Check for padding between partition table and the first partition
+    else if (partitions.front().ptEntry.Offset.Offset > ptSize) {
+        padding.ptEntry.Offset.Offset = ptSize;
+        padding.ptEntry.Length = partitions.front().ptEntry.Offset.Offset - padding.ptEntry.Offset.Offset;
+        padding.type = Types::Padding;
+        partitions.insert(partitions.begin(), padding);
+    }
+    // Check for intersections/paddings between partitions
+    for (size_t i = 1; i < partitions.size(); i++) {
+        UINT32 previousPartitionEnd = partitions[i - 1].ptEntry.Offset.Offset + partitions[i - 1].ptEntry.Length;
+        
+        // Check that current region is fully present in the image
+        if ((UINT64)partitions[i].ptEntry.Offset.Offset + (UINT64)partitions[i].ptEntry.Length > (UINT64)region.size()) {
+            if ((UINT64)partitions[i].ptEntry.Offset.Offset >= (UINT64)region.size()) {
+                msg(usprintf("%s: CPD partition is located outside of the opened image, skipped", __FUNCTION__), partitions[i].index);
+                partitions.erase(partitions.begin() + i);
+                goto make_partition_table_consistent;
+            }
+            else {
+                if (!partitions[i].hasMetaData && partitions[i].ptEntry.Offset.HuffmanCompressed) {
+                    msg(usprintf("%s: CPD partition is compressed but doesn't have metadata and can't fit into its region, length adjusted", __FUNCTION__),
+                        partitions[i].index);
+                }
+                else {
+                    msg(usprintf("%s: CPD partition can't fit into its region, truncated", __FUNCTION__), partitions[i].index);
+                }
+                partitions[i].ptEntry.Length = (UINT32)region.size() - (UINT32)partitions[i].ptEntry.Offset.Offset;
+            }
+        }
+        
+        // Check for intersection with previous partition
+        if (partitions[i].ptEntry.Offset.Offset < previousPartitionEnd) {
+            // Check if previous partition was compressed but did not have metadata
+            if (!partitions[i - 1].hasMetaData && partitions[i - 1].ptEntry.Offset.HuffmanCompressed) {
+                msg(usprintf("%s: CPD partition is compressed but doesn't have metadata, length adjusted", __FUNCTION__),
+                    partitions[i - 1].index);
+                partitions[i - 1].ptEntry.Length = (UINT32)partitions[i].ptEntry.Offset.Offset - (UINT32)partitions[i - 1].ptEntry.Offset.Offset;
+                goto make_partition_table_consistent;
+            }
+            
+            // Check if current partition is located inside previous one
+            if (partitions[i].ptEntry.Offset.Offset + partitions[i].ptEntry.Length <= previousPartitionEnd) {
+                msg(usprintf("%s: CPD partition is located inside another CPD partition, skipped", __FUNCTION__),
+                    partitions[i].index);
+                partitions.erase(partitions.begin() + i);
+                goto make_partition_table_consistent;
+            }
+            else {
+                msg(usprintf("%s: CPD partition intersects with previous one, skipped", __FUNCTION__),
+                    partitions[i].index);
+                partitions.erase(partitions.begin() + i);
+                goto make_partition_table_consistent;
+            }
+        }
+        // Check for padding between current and previous partitions
+        else if (partitions[i].ptEntry.Offset.Offset > previousPartitionEnd) {
+            padding.ptEntry.Offset.Offset = previousPartitionEnd;
+            padding.ptEntry.Length = partitions[i].ptEntry.Offset.Offset - previousPartitionEnd;
+            padding.type = Types::Padding;
+            std::vector<CPD_PARTITION_INFO>::iterator iter = partitions.begin();
+            std::advance(iter, i);
+            partitions.insert(iter, padding);
+        }
+    }
+    // Check for padding after the last region
+    if ((UINT64)partitions.back().ptEntry.Offset.Offset + (UINT64)partitions.back().ptEntry.Length < (UINT64)region.size()) {
+        padding.ptEntry.Offset.Offset = partitions.back().ptEntry.Offset.Offset + partitions.back().ptEntry.Length;
+        padding.ptEntry.Length = (UINT32)region.size() - padding.ptEntry.Offset.Offset;
+        padding.type = Types::Padding;
+        partitions.push_back(padding);
+    }
+    
+    // Partition map is consistent
+    for (size_t i = 0; i < partitions.size(); i++) {
+        if (partitions[i].type == Types::CpdPartition) {
+            UByteArray partition = region.mid(partitions[i].ptEntry.Offset.Offset, partitions[i].ptEntry.Length);
+            
+            // Get info
+            name = usprintf("%.12s", partitions[i].ptEntry.EntryName);
+            
+            // It's a manifest
+            if (name.endsWith(".man")) {
+                if (!partitions[i].ptEntry.Offset.HuffmanCompressed
+                    && partitions[i].ptEntry.Length >= sizeof(CPD_MANIFEST_HEADER)) {
+                    const CPD_MANIFEST_HEADER* manifestHeader = (const CPD_MANIFEST_HEADER*) partition.constData();
+                    if (manifestHeader->HeaderId == ME_MANIFEST_HEADER_ID && (manifestHeader->HeaderLength * sizeof(UINT32)) <= partition.size()) {
+                        UByteArray header = partition.left(manifestHeader->HeaderLength * sizeof(UINT32));
+                        UByteArray body = partition.mid(manifestHeader->HeaderLength * sizeof(UINT32));
+                        
+                        info = usprintf("Header type: %u\nHeader length: %Xh (%u)\nHeader version: %Xh\nFlags: %08Xh\nVendor: %Xh\n"
+                                        "Date: %Xh\nSize: %Xh (%u)\nVersion: %u.%u.%u.%u\nSecurity version number: %u\nModulus size: %Xh (%u)\nExponent size: %Xh (%u)",
+                                        manifestHeader->HeaderType,
+                                        manifestHeader->HeaderLength * (UINT32)sizeof(UINT32), manifestHeader->HeaderLength * (UINT32)sizeof(UINT32),
+                                        manifestHeader->HeaderVersion,
+                                        manifestHeader->Flags,
+                                        manifestHeader->Vendor,
+                                        manifestHeader->Date,
+                                        manifestHeader->Size * (UINT32)sizeof(UINT32), manifestHeader->Size * (UINT32)sizeof(UINT32),
+                                        manifestHeader->VersionMajor, manifestHeader->VersionMinor, manifestHeader->VersionBugfix, manifestHeader->VersionBuild,
+                                        manifestHeader->SecurityVersion,
+                                        manifestHeader->ModulusSize * (UINT32)sizeof(UINT32), manifestHeader->ModulusSize * (UINT32)sizeof(UINT32),
+                                        manifestHeader->ExponentSize * (UINT32)sizeof(UINT32), manifestHeader->ExponentSize * (UINT32)sizeof(UINT32));
+                        
+                        // Add tree item
+                        UModelIndex partitionIndex = model->addItem(localOffset + partitions[i].ptEntry.Offset.Offset, Types::CpdPartition, Subtypes::ManifestCpdPartition, name, UString(), info, header, body, UByteArray(), Fixed, parent);
+                        
+                        // Parse data as extensions area
+                        // Add the header size as a local offset
+                        // Since the body starts after the header length
+                        parseCpdExtensionsArea(partitionIndex, (UINT32)header.size());
+                    }
+                }
+            }
+            // It's a metadata
+            else if (name.endsWith(".met")) {
+                info = UString("Huffman compressed: ")
+                + (partitions[i].ptEntry.Offset.HuffmanCompressed ? "Yes" : "No");
+                
+                // Calculate SHA256 hash over the metadata and add it to its info
+                UByteArray hash(SHA256_HASH_SIZE, '\x00');
+                sha256(partition.constData(), partition.size(), hash.data());
+                info += UString("\nMetadata hash: ") + UString(hash.toHex().constData());
+                
+                // Add three item
+                UModelIndex partitionIndex = model->addItem(localOffset + partitions[i].ptEntry.Offset.Offset, Types::CpdPartition,  Subtypes::MetadataCpdPartition, name, UString(), info, UByteArray(), partition, UByteArray(), Fixed, parent);
+                
+                // Parse data as extensions area
+                parseCpdExtensionsArea(partitionIndex, 0);
+            }
+            // It's a code
+            else {
+                info = UString("Huffman compressed: ")
+                + (partitions[i].ptEntry.Offset.HuffmanCompressed ? "Yes" : "No");
+                
+                // Calculate SHA256 hash over the code and add it to its info
+                UByteArray hash(SHA256_HASH_SIZE, '\x00');
+                sha256(partition.constData(), partition.size(), hash.data());
+                info += UString("\nHash: ") + UString(hash.toHex().constData());
+                
+                UModelIndex codeIndex = model->addItem(localOffset + partitions[i].ptEntry.Offset.Offset, Types::CpdPartition, Subtypes::CodeCpdPartition, name, UString(), info, UByteArray(), partition, UByteArray(), Fixed, parent);
+                (void) parseRawArea(codeIndex);
+            }
+        }
+        else if (partitions[i].type == Types::Padding) {
+            UByteArray partition = region.mid(partitions[i].ptEntry.Offset.Offset, partitions[i].ptEntry.Length);
+            
+            // Get info
+            name = UString("Padding");
+            
+            // Add tree item
+            model->addItem(localOffset + partitions[i].ptEntry.Offset.Offset, Types::Padding, getPaddingType(partition), name, UString(), UString(), UByteArray(), partition, UByteArray(), Fixed, parent);
+        }
+        else {
+            msg(usprintf("%s: CPD partition of unknown type found", __FUNCTION__), parent);
+            return U_INVALID_ME_PARTITION_TABLE;
+        }
+    }
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseFtwStoreHeader(const QByteArray & store, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+USTATUS FfsParser::parseCpdExtensionsArea(const UModelIndex & index, const UINT32 localOffset)
 {
-    const UINT32 dataSize = (const UINT32)store.size();
-
-    // Check store size
-    if (dataSize < sizeof(EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER64)) {
-        msg(QObject::tr("parseFtwStoreHeader: volume body is too small even for FTW store header"), parent);
-        return ERR_SUCCESS;
+    if (!index.isValid()) {
+        return U_INVALID_PARAMETER;
     }
+    
+    UByteArray body = model->body(index);
+    UINT32 offset = 0;
+    UINT32 bodySize = (UINT32)body.size();
+    while (bodySize - offset >= sizeof(CPD_EXTENTION_HEADER)) {
+        const CPD_EXTENTION_HEADER* extHeader = (const CPD_EXTENTION_HEADER*)(body.constData() + offset);
+        if (extHeader->Length > 0 && bodySize - offset >= extHeader->Length) {
+            UByteArray partition = body.mid(offset, extHeader->Length);
+            
+            UString name = cpdExtensionTypeToUstring(extHeader->Type);
+            UString info = usprintf("Type: %Xh", extHeader->Type);
+            
+            // Parse Signed Package Info a bit further
+            UModelIndex extIndex;
+            if (extHeader->Type == CPD_EXT_TYPE_SIGNED_PACKAGE_INFO) {
+                UByteArray header = partition.left(sizeof(CPD_EXT_SIGNED_PACKAGE_INFO));
+                UByteArray data = partition.mid(header.size());
+                if (header.size() >= sizeof(CPD_EXT_SIGNED_PACKAGE_INFO)) {
+                    const CPD_EXT_SIGNED_PACKAGE_INFO* infoHeader = (const CPD_EXT_SIGNED_PACKAGE_INFO*)header.constData();
 
-    // Get FTW block headers
-    const EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER32* ftw32BlockHeader = (const EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER32*)store.constData();
-    const EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER64* ftw64BlockHeader = (const EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER64*)store.constData();
+                    info = usprintf("Type: %Xh\n"
+                                    "Package name: %.4s\nVersion control number: %Xh\nSecurity version number: %Xh\n"
+                                    "Usage bitmap: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+                                    infoHeader->ExtensionType,
+                                    infoHeader->PackageName,
+                                    infoHeader->Vcn,
+                                    infoHeader->Svn,
+                                    infoHeader->UsageBitmap[0],  infoHeader->UsageBitmap[1],  infoHeader->UsageBitmap[2],  infoHeader->UsageBitmap[3],
+                                    infoHeader->UsageBitmap[4],  infoHeader->UsageBitmap[5],  infoHeader->UsageBitmap[6],  infoHeader->UsageBitmap[7],
+                                    infoHeader->UsageBitmap[8],  infoHeader->UsageBitmap[9],  infoHeader->UsageBitmap[10], infoHeader->UsageBitmap[11],
+                                    infoHeader->UsageBitmap[12], infoHeader->UsageBitmap[13], infoHeader->UsageBitmap[14], infoHeader->UsageBitmap[15]);
 
-    // Check store size
-    UINT32 ftwBlockSize;
-    bool has32bitHeader;
-    if (ftw32BlockHeader->WriteQueueSize % 0x10 == 0x04) { // Header with 32 bit WriteQueueSize
-        ftwBlockSize = sizeof(EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER32) + ftw32BlockHeader->WriteQueueSize;
-        has32bitHeader = true;
+                    // Add tree item
+                    extIndex = model->addItem(offset + localOffset, Types::CpdExtension, 0, name, UString(), info, header, data, UByteArray(), Fixed, index);
+                    parseSignedPackageInfoData(extIndex);
+                }
+            }
+            // Parse IFWI Partition Manifest a bit further
+            else if (extHeader->Type == CPD_EXT_TYPE_IFWI_PARTITION_MANIFEST && partition.size() >= sizeof(CPD_EXT_IFWI_PARTITION_MANIFEST)) {
+                const CPD_EXT_IFWI_PARTITION_MANIFEST* attrHeader = (const CPD_EXT_IFWI_PARTITION_MANIFEST*)partition.constData();
+                
+                // Check HashSize to be sane.
+                UINT32 hashSize = attrHeader->HashSize;
+                bool msgHashSizeMismatch = false;
+                if (hashSize > sizeof(attrHeader->CompletePartitionHash)) {
+                    hashSize = sizeof(attrHeader->CompletePartitionHash);
+                    msgHashSizeMismatch = true;
+                }
+                
+                // This hash is stored reversed
+                // Need to reverse it back to normal
+                UByteArray hash((const char*)&attrHeader->CompletePartitionHash, hashSize);
+                std::reverse(hash.begin(), hash.end());
+                
+                info = usprintf("Type: %Xh\n"
+                                "Partition name: %.4s\nPartition length: %Xh\nPartition version major: %Xh\nPartition version minor: %Xh\n"
+                                "Data format version: %Xh\nInstance ID: %Xh\nHash algorithm: %Xh\nHash size: %Xh\nAction on update: %Xh",
+                                attrHeader->ExtensionType,
+                                attrHeader->PartitionName,
+                                attrHeader->CompletePartitionLength,
+                                attrHeader->PartitionVersionMajor, attrHeader->PartitionVersionMinor,
+                                attrHeader->DataFormatVersion,
+                                attrHeader->InstanceId,
+                                attrHeader->HashAlgorithm,
+                                attrHeader->HashSize,
+                                attrHeader->ActionOnUpdate)
+                + UString("\nSupport multiple instances: ") + (attrHeader->SupportMultipleInstances ? "Yes" : "No")
+                + UString("\nSupport API version based update: ") + (attrHeader->SupportApiVersionBasedUpdate ? "Yes" : "No")
+                + UString("\nObey full update rules: ") + (attrHeader->ObeyFullUpdateRules ? "Yes" : "No")
+                + UString("\nIFR enable only: ") + (attrHeader->IfrEnableOnly ? "Yes" : "No")
+                + UString("\nAllow cross point update: ") + (attrHeader->AllowCrossPointUpdate ? "Yes" : "No")
+                + UString("\nAllow cross hotfix update: ") + (attrHeader->AllowCrossHotfixUpdate ? "Yes" : "No")
+                + UString("\nPartial update only: ") + (attrHeader->PartialUpdateOnly ? "Yes" : "No")
+                + UString("\nPartition hash: ") +  UString(hash.toHex().constData());
+                
+                // Add tree item
+                extIndex = model->addItem(offset + localOffset, Types::CpdExtension, 0, name, UString(), info, UByteArray(), partition, UByteArray(), Fixed, index);
+                if (msgHashSizeMismatch) {
+                    msg(usprintf("%s: IFWI Partition Manifest hash size is %u, maximum allowed is %u, truncated", __FUNCTION__, attrHeader->HashSize, (UINT32)sizeof(attrHeader->CompletePartitionHash)), extIndex);
+                }
+            }
+            // Parse Module Attributes a bit further
+            else if (extHeader->Type == CPD_EXT_TYPE_MODULE_ATTRIBUTES && partition.size() >= sizeof(CPD_EXT_MODULE_ATTRIBUTES)) {
+                const CPD_EXT_MODULE_ATTRIBUTES* attrHeader = (const CPD_EXT_MODULE_ATTRIBUTES*)partition.constData();
+                int hashSize = (UINT32)partition.size() - CpdExtModuleImageHashOffset;
+
+                // This hash is stored reversed
+                // Need to reverse it back to normal
+                UByteArray hash((const char*)attrHeader + CpdExtModuleImageHashOffset, hashSize);
+                std::reverse(hash.begin(), hash.end());
+                
+                info = usprintf("Type: %Xh\n"
+                                "Compression type: %Xh\nUncompressed size: %Xh (%u)\nCompressed size: %Xh (%u)\nGlobal module ID: %Xh\nImage hash: ",
+                                attrHeader->ExtensionType,
+                                attrHeader->CompressionType,
+                                attrHeader->UncompressedSize, attrHeader->UncompressedSize,
+                                attrHeader->CompressedSize, attrHeader->CompressedSize,
+                                attrHeader->GlobalModuleId) + UString(hash.toHex().constData());
+                
+                // Add tree item
+                extIndex = model->addItem(offset + localOffset, Types::CpdExtension, 0, name, UString(), info, UByteArray(), partition, UByteArray(), Fixed, index);
+            }
+            // Parse everything else
+            else {
+                // Add tree item, if needed
+                extIndex = model->addItem(offset + localOffset, Types::CpdExtension, 0, name, UString(), info, UByteArray(), partition, UByteArray(), Fixed, index);
+            }
+            
+            // There needs to be a more generic way to do it, but it is fine for now
+            if (extHeader->Type > CPD_EXT_TYPE_TBT_METADATA
+                && extHeader->Type != CPD_EXT_TYPE_GMF_CERTIFICATE
+                && extHeader->Type != CPD_EXT_TYPE_GMF_BODY
+                && extHeader->Type != CPD_EXT_TYPE_KEY_MANIFEST_EXT
+                && extHeader->Type != CPD_EXT_TYPE_SIGNED_PACKAGE_INFO_EXT
+                && extHeader->Type != CPD_EXT_TYPE_SPS_PLATFORM_ID) {
+                msg(usprintf("%s: CPD extension of unknown type found", __FUNCTION__), extIndex);
+            }
+            
+            offset += extHeader->Length;
+        }
+        else break;
     }
-    else { // Header with 64 bit WriteQueueSize
-        ftwBlockSize = sizeof(EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER64) + ftw64BlockHeader->WriteQueueSize;
-        has32bitHeader = false;
+    
+    // Check if we parsed everything, add the rest at the end as padding
+    if (offset < bodySize) {
+        UByteArray padding = body.mid(offset, bodySize - offset);
+        
+        // Get info
+        UString name = UString("Padding");
+        
+        // Add tree item
+        model->addItem(offset + localOffset, Types::Padding, getPaddingType(padding), name, UString(), UString(), UByteArray(), padding, UByteArray(), Fixed, index);
     }
-    if (dataSize < ftwBlockSize) {
-        msg(QObject::tr("parseFtwStoreHeader: FTW store size %1h (%2) is greater than volume body size %3h (%4)")
-            .hexarg(ftwBlockSize).arg(ftwBlockSize)
-            .hexarg(dataSize).arg(dataSize), parent);
-        return ERR_SUCCESS;
-    }
-
-    // Get parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
-    // Construct header and body
-    UINT32 headerSize = has32bitHeader ? sizeof(EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER32) : sizeof(EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER64);
-    QByteArray header = store.left(headerSize);
-    QByteArray body = store.mid(headerSize, ftwBlockSize - headerSize);
-
-    // Check block header checksum
-    QByteArray crcHeader = header;
-    EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER32* crcFtwBlockHeader = (EFI_FAULT_TOLERANT_WORKING_BLOCK_HEADER32*)header.data();
-    crcFtwBlockHeader->Crc = pdata.emptyByte ? 0xFFFFFFFF : 0;
-    crcFtwBlockHeader->State = pdata.emptyByte ? 0xFF : 0;
-    UINT32 calculatedCrc = crc32(0, (const UINT8*)crcFtwBlockHeader, headerSize);
-
-    // Add info
-    QString name = QObject::tr("FTW store");
-    QString info = QObject::tr("Signature: %1\nFull size: %2h (%3)\nHeader size: %4h (%5)\nBody size: %6h (%7)\nState: %8h\nHeader CRC32: %9")
-        .arg(guidToQString(ftw32BlockHeader->Signature))
-        .hexarg(ftwBlockSize).arg(ftwBlockSize)
-        .hexarg(headerSize).arg(headerSize)
-        .hexarg(body.size()).arg(body.size())
-        .hexarg2(ftw32BlockHeader->State, 2)
-        .arg(ftw32BlockHeader->Crc == calculatedCrc ?
-            QObject::tr("%1h, valid").hexarg2(ftw32BlockHeader->Crc, 8) :
-            QObject::tr("%1h, invalid, should be %2h").hexarg2(ftw32BlockHeader->Crc, 8).hexarg2(calculatedCrc, 8));
-
-    // Add correct offset
-    pdata.offset = parentOffset;
-
-    // Add tree item
-    index = model->addItem(Types::FtwStore, 0, name, QString(), info, header, body, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
-    return ERR_SUCCESS;
+    
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseFdcStoreHeader(const QByteArray & store, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+USTATUS FfsParser::parseSignedPackageInfoData(const UModelIndex & index)
 {
-    const UINT32 dataSize = (const UINT32)store.size();
-
-    // Check store size
-    if (dataSize < sizeof(FDC_VOLUME_HEADER)) {
-        msg(QObject::tr("parseFdcStoreHeader: volume body is too small even for FDC store header"), parent);
-        return ERR_SUCCESS;
+    if (!index.isValid()) {
+        return U_INVALID_PARAMETER;
     }
-
-    // Get Fdc store header
-    const FDC_VOLUME_HEADER* fdcStoreHeader = (const FDC_VOLUME_HEADER*)store.constData();
-
-    // Check store size
-    if (dataSize < fdcStoreHeader->Size) {
-        msg(QObject::tr("parseFdcStoreHeader: FDC store size %1h (%2) is greater than volume body size %3h (%4)")
-            .hexarg(fdcStoreHeader->Size).arg(fdcStoreHeader->Size)
-            .hexarg(dataSize).arg(dataSize), parent);
-        return ERR_SUCCESS;
+    
+    UByteArray body = model->body(index);
+    UINT32 offset = 0;
+    UINT32 bodySize = (UINT32)body.size();
+    while (offset < bodySize && bodySize - offset >= sizeof(CPD_EXT_SIGNED_PACKAGE_INFO_MODULE)) {
+        const CPD_EXT_SIGNED_PACKAGE_INFO_MODULE* moduleHeader = (const CPD_EXT_SIGNED_PACKAGE_INFO_MODULE*)(body.constData() + offset);
+        if (bodySize - offset >= sizeof(CPD_EXT_SIGNED_PACKAGE_INFO_MODULE) + moduleHeader->HashSize) {
+            UByteArray mdl((const char*)moduleHeader, CpdExtSignedPkgMetadataHashOffset + moduleHeader->HashSize);
+            UString name = usprintf("%.12s", moduleHeader->Name);
+            
+            // This hash is stored reversed
+            // Need to reverse it back to normal
+            UByteArray hash((const char*)moduleHeader + CpdExtSignedPkgMetadataHashOffset, moduleHeader->HashSize);
+            std::reverse(hash.begin(), hash.end());
+            
+            UString info = usprintf("Type: %Xh\nHash algorithm: %Xh\nHash size: %Xh (%u)\nMetadata size: %Xh (%u)\nMetadata hash: ",
+                                    moduleHeader->Type,
+                                    moduleHeader->HashAlgorithm,
+                                    moduleHeader->HashSize, moduleHeader->HashSize,
+                                    moduleHeader->MetadataSize, moduleHeader->MetadataSize) + UString(hash.toHex().constData());
+            // Add tree item
+            model->addItem(offset, Types::CpdSpiEntry, 0, name, UString(), info, UByteArray(), mdl, UByteArray(), Fixed, index);
+            offset += mdl.size();
+        }
+        else break;
     }
+    
+    // Check if we parsed everything, add the rest at the end as padding
+    if (offset < bodySize) {
+        UByteArray padding = body.mid(offset, bodySize - offset);
+        
+        // Get info
+        UString name = UString("Padding");
+        
+        // Add tree item
+        model->addItem(offset, Types::Padding, getPaddingType(padding), name, UString(), UString(), UByteArray(), padding, UByteArray(), Fixed, index);
+    }
+    
+    return U_SUCCESS;
+}
 
-    // Determine internal volume header size
-    const EFI_FIRMWARE_VOLUME_HEADER* volumeHeader = (const EFI_FIRMWARE_VOLUME_HEADER*)(fdcStoreHeader + 1);
-    UINT32 headerSize;
-    if (volumeHeader->Revision > 1 && volumeHeader->ExtHeaderOffset) {
-        const EFI_FIRMWARE_VOLUME_EXT_HEADER* extendedHeader = (const EFI_FIRMWARE_VOLUME_EXT_HEADER*)((const UINT8*)volumeHeader + volumeHeader->ExtHeaderOffset);
-        headerSize = volumeHeader->ExtHeaderOffset + extendedHeader->ExtHeaderSize;
+void FfsParser::outputInfo(void) {
+    // Show ffsParser's messages
+    std::vector<std::pair<UString, UModelIndex> > messages = getMessages();
+    for (size_t i = 0; i < messages.size(); i++) {
+        std::cout << (const char *)messages[i].first.toLocal8Bit() << std::endl;
+    }
+    
+    // Get last VTF
+    std::vector<std::pair<std::vector<UString>, UModelIndex > > fitTable = getFitTable();
+    if (fitTable.size()) {
+        std::cout << "---------------------------------------------------------------------------" << std::endl;
+        std::cout << "     Address      |   Size    |  Ver  | CS  |          Type / Info          " << std::endl;
+        std::cout << "---------------------------------------------------------------------------" << std::endl;
+        for (size_t i = 0; i < fitTable.size(); i++) {
+            std::cout
+            << (const char *)fitTable[i].first[0].toLocal8Bit() << " | "
+            << (const char *)fitTable[i].first[1].toLocal8Bit() << " | "
+            << (const char *)fitTable[i].first[2].toLocal8Bit() << " | "
+            << (const char *)fitTable[i].first[3].toLocal8Bit() << " | "
+            << (const char *)fitTable[i].first[4].toLocal8Bit() << " | "
+            << (const char *)fitTable[i].first[5].toLocal8Bit() << std::endl;
+        }
+    }
+    
+    // Get security info
+    UString secInfo = getSecurityInfo();
+    if (!secInfo.isEmpty()) {
+        std::cout << "---------------------------------------------------------------------------"  << std::endl;
+        std::cout << "Security Info" << std::endl;
+        std::cout << "---------------------------------------------------------------------------"  << std::endl;
+        std::cout << (const char *)secInfo.toLocal8Bit() << std::endl;
+    }
+}
+
+
+// More or less AMD-specific, but can be used as common
+USTATUS FfsParser::findByRange(const UINT32 base, const UINT32 size, const UModelIndex& index, UModelIndex& found)
+{
+    if (model->compressed(index))
+        return U_ITEM_NOT_FOUND;
+
+    // Sort by inserting
+    for (int i = 0; i < model->rowCount(index); i++) {
+        UModelIndex current = model->index(i, 0, index);
+        UINT32 currentSize = model->fullSize(current);
+
+        // Must be within the existing region
+        if (base < model->base(current) || (base + size) >(model->base(current) + currentSize))
+            continue;
+        found = current;
+        if ((base == model->base(current)) && (size == currentSize))
+            return U_SUCCESS;
+
+        findByRange(base, size, current, found);
+
+        return U_SUCCESS;
+    }
+    return U_ITEM_NOT_FOUND;
+}
+
+USTATUS FfsParser::insertByRange(UINT32 offset, const UINT8 type, const UINT8 subtype,
+    const UString name, const UString text, const UString info,
+    const UINT32 hdrSize, const UINT32 bodySize, const UINT32 tailSize,
+    const UModelIndex& parent, UModelIndex& index)
+{
+    UModelIndex containerIndex = imageIndex(parent);
+    const UString parentName = model->type(parent) == Types::Image ? UString() : model->name(parent);
+    const UINT32 imageBase = model->base(containerIndex) + offset;
+    const UINT32 imageSize = model->fullSize(containerIndex);
+    const UINT32 fullSize = offset + hdrSize + bodySize + tailSize > imageSize ? imageSize - offset : hdrSize + bodySize + tailSize;
+
+    UModelIndex foundIndex;
+    USTATUS result = findByRange(imageBase, fullSize, containerIndex, foundIndex);
+    UString parentInfo = UString("Parent: ");
+    if (model->type(parent) == Types::DirectoryTableEntry) {
+        parentInfo += model->name(model->parent(parent))
+            + usprintf(" (entry %d)", static_cast<TreeItem*>(parent.internalPointer())->row() + 1)
+            + usprintf(", base: %Xh\n", model->base(model->parent(parent)));
     }
     else
-        headerSize = volumeHeader->HeaderLength;
-
-    // Extended header end can be unaligned
-    headerSize = ALIGN8(headerSize);
-
-    // Add VSS store header
-    headerSize += sizeof(VSS_VARIABLE_STORE_HEADER);
-
-    // Add FDC header 
-    headerSize += sizeof(FDC_VOLUME_HEADER);
-
-    // Check sanity of combined header size
-    if (dataSize < headerSize) {
-        msg(QObject::tr("parseFdcStoreHeader: FDC store header size %1h (%2) is greater than volume body size %3h (%4)")
-            .hexarg2(fdcStoreHeader->Size, 8).arg(fdcStoreHeader->Size)
-            .hexarg2(dataSize, 8).arg(dataSize), parent);
-        return ERR_SUCCESS;
+        parentInfo += model->name(parent) + usprintf(", base: %Xh\n", model->base(parent));
+    if (result == U_SUCCESS && foundIndex.isValid()) {
+        if (model->type(foundIndex) == type && model->subtype(foundIndex) == subtype
+            && model->base(foundIndex) == imageBase && model->fullSize(foundIndex) == fullSize)
+        {
+            index = foundIndex;
+            if (static_cast<TreeItem*>(parent.internalPointer()) != static_cast<TreeItem*>(index.internalPointer())->parent())
+                model->addInfo(index, parentInfo);
+            msg(usprintf("%s: skipping already added item at %Xh: ", __FUNCTION__, offset) + model->name(index), index);
+            return U_DIR_ALREADY_EXIST;
+        }
+        containerIndex = foundIndex;
     }
 
-    // Get parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
+    // Sort by inserting
+    UINT8 mode = CREATE_MODE_APPEND;
+    UModelIndex insertIndex = containerIndex;
+    TreeItem* parentItem = static_cast<TreeItem*>(containerIndex.internalPointer());
+    for (int i = 0; i < model->rowCount(containerIndex); i++) {
+        UModelIndex current = model->index(i, 0, containerIndex);
+        if (model->base(current) > imageBase) {
+            mode = CREATE_MODE_BEFORE;
+            insertIndex = current;
+            parentItem = static_cast<TreeItem*>(containerIndex.internalPointer());
+            break;
+        }
+    }
 
-    // Construct header and body
-    QByteArray header = store.left(headerSize);
-    QByteArray body = store.mid(headerSize, fdcStoreHeader->Size - headerSize);
+    const UINT32 realHdrSize = hdrSize > fullSize ? fullSize : hdrSize;
+    const UINT32 realBodySize = bodySize > fullSize - realHdrSize ? fullSize - realHdrSize : bodySize;
+    const UINT32 realTailSize = tailSize > fullSize - realHdrSize - realBodySize ? fullSize - realHdrSize - realBodySize : tailSize;
+    UString itemInfo = info;
+    if (static_cast<TreeItem*>(parent.internalPointer()) != parentItem)
+        itemInfo += parentInfo;
 
-    // Add info
-    QString name = QObject::tr("FDC store");
-    QString info = QObject::tr("Signature: _FDC\nFull size: %1h (%2)\nHeader size: %3h (%4)\nBody size: %5h (%6)")
-        .hexarg(fdcStoreHeader->Size).arg(fdcStoreHeader->Size)
-        .hexarg(header.size()).arg(header.size())
-        .hexarg(body.size()).arg(body.size());
+    // Add directory file tree item
+    const UINT32 hdrOffset = imageBase - model->base(containerIndex);
+    const UINT32 bodyOffset = hdrOffset + realHdrSize;
+    const UINT32 tailOffset = bodyOffset + realBodySize;
+    const UByteArray containerImage = model->full(containerIndex);
+    index = model->addItem(hdrOffset, type, subtype, name, text, itemInfo,
+        containerImage.mid(hdrOffset, realHdrSize), containerImage.mid(bodyOffset, realBodySize), containerImage.mid(tailOffset, realTailSize),
+        Fixed, insertIndex, mode);
 
-    // TODO: add internal headers info
-
-    // Add correct offset
-    pdata.offset = parentOffset;
-
-    // Add tree item
-    index = model->addItem(Types::FdcStore, 0, name, QString(), info, header, body, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
-    return ERR_SUCCESS;
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseFsysStoreHeader(const QByteArray & store, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+
+// Convert the ID to known file names
+UString FfsParser::pspFileName(const UINT8 type, const UINT8 sub)
 {
-    const UINT32 dataSize = (const UINT32)store.size();
+    UString fileName;
 
-    // Check store size
-    if (dataSize < sizeof(APPLE_FSYS_STORE_HEADER)) {
-        msg(QObject::tr("parseFsysStoreHeader: volume body is too small even for Fsys store header"), parent);
-        return ERR_SUCCESS;
+    switch (type) {
+        // PSP types
+        case AMD_FW_PSP_PUBKEY:         fileName = "PSP public key"; break;
+        case AMD_FW_PSP_BOOTLOADER:     fileName = "PSP initial bootloader"; break;
+        case AMD_FW_PSP_SECURED_OS:     fileName = "PSP secured OS"; break;
+        case AMD_FW_PSP_RECOVERY:       fileName = "PSP recovery bootloader"; break;
+        case AMD_FW_PSP_NVRAM:          fileName = "PSP NVRAM"; break;
+        case AMD_FW_RTM_PUBKEY:         fileName = "BIOS RTM public key"; break;
+        case AMD_FW_BIOS_RTM:           fileName = "BIOS RTM firmware"; break;
+        case AMD_FW_PSP_SMU_FIRMWARE:   fileName = "SMU firmware"; break;
+        case AMD_FW_PSP_SECURED_DEBUG:  fileName = "PSP secured debug"; break;
+        case AMD_FW_ABL_PUBKEY:         fileName = "AGESA bootloader public key"; break;
+        case AMD_PSP_FUSE_CHAIN:        fileName = "PSP fuse chain"; break;
+        case AMD_FW_PSP_TRUSTLETS:      fileName = "PSP trustlets"; break;
+        case AMD_FW_PSP_TRUSTLETKEY:    fileName = "PSP trustlet key"; break;
+        case AMD_FW_AGESA_RESUME:       fileName = "AGESA resume firmware"; break;
+        case AMD_FW_PSP_SMU_FIRMWARE2:  fileName = "SMU firmware 2"; break;
+        case AMD_DEBUG_UNLOCK:          fileName = "PSP debug unlock"; break;
+        case AMD_PSP_MCLF_TRUSTLETS:    fileName = "PSP MCLF trustlets"; break;
+        case AMD_FW_PSP_TEEIPKEY:       fileName = "PSP TEE IP key"; break;
+        case AMD_SEV_DRIVER:            fileName = "SEV driver"; break;
+        case AMD_BOOT_DRIVER:           fileName = "Boot driver"; break;
+        case AMD_SOC_DRIVER:            fileName = "SoC driver"; break;
+        case AMD_DEBUG_DRIVER:          fileName = "Debug driver"; break;
+        case AMD_INTERFACE_DRIVER:      fileName = "Interface driver"; break;
+        case AMD_HW_IPCFG:              fileName = "HW IP configuration"; break;
+        case AMD_WRAPPED_IKEK:          fileName = "Wrapped IKeK"; break;
+        case AMD_TOKEN_UNLOCK:          fileName = "Token unlock"; break;
+        case AMD_SEC_GASKET:            fileName = "Security gasket firmware"; break;
+        case AMD_MP2_FW:                fileName = "MP2 firmware"; break;
+        case AMD_DRIVER_ENTRIES:        fileName = "Driver entries"; break;
+        case AMD_FW_KVM_IMAGE:          fileName = "KVM image"; break;
+        case AMD_FW_MP5:                fileName = "MP5 firmware"; break;
+        case AMD_S0I3_DRIVER:           fileName = "S0i3 driver"; break;
+        case AMD_ABL0:                  fileName = "AGESA bootloader stage 0"; break;
+        case AMD_ABL1:                  fileName = "AGESA bootloader stage 1"; break;
+        case AMD_ABL2:                  fileName = "AGESA bootloader stage 2"; break;
+        case AMD_ABL3:                  fileName = "AGESA bootloader stage 3"; break;
+        case AMD_ABL4:                  fileName = "AGESA bootloader stage 4"; break;
+        case AMD_ABL5:                  fileName = "AGESA bootloader stage 5"; break;
+        case AMD_ABL6:                  fileName = "AGESA bootloader stage 6"; break;
+        case AMD_ABL7:                  fileName = "AGESA bootloader stage 7"; break;
+        case AMD_SEV_DATA:              fileName = "SEV data"; break;
+        case AMD_SEV_CODE:              fileName = "SEV code"; break;
+        case AMD_FW_PSP_WHITELIST:      fileName = "PSP whitelist"; break;
+        case AMD_VBIOS_BTLOADER:        fileName = "Video BIOS bootloader"; break;
+        case AMD_FW_L2_PTR:             fileName = "PSP L2 directory"; break;
+        case AMD_FW_DXIO:               fileName = "DXIO firmware"; break;
+        case AMD_FW_USB_PHY:            fileName = "USB PHY firmware"; break;
+        case AMD_FW_TOS_SEC_POLICY:     fileName = "TOS security policy"; break;
+        case AMD_EFS_BACKUP:            fileName = "EFS backup"; break;
+        case AMD_FW_DRTM_TA:            fileName = "DRTM trusted application"; break;
+        case AMD_FW_RECOVERYAB_A:       fileName = "RecoveryAB A"; break;
+        case AMD_FW_RECOVERYAB_B:       fileName = "RecoveryAB B"; break;
+        case AMD_FW_BIOS_TABLE:         fileName = "BIOS table"; break;
+        case AMD_FW_KEYDB_BL:           fileName = "Bootloader key database"; break;
+        case AMD_FW_KEYDB_TOS:          fileName = "TOS key database"; break;
+        case AMD_FW_PSP_VERSTAGE:       fileName = "PSP verstage firmware"; break;
+        case AMD_FW_VERSTAGE_SIG:       fileName = "Verstage signature"; break;
+        case AMD_RPMC_NVRAM:            fileName = "Replay-protected NVRAM"; break;
+        case AMD_FW_SPL:                fileName = "Security policy loader"; break;
+        case AMD_FW_DMCU_ERAM:          fileName = "Embedded RAM display MCU"; break;
+        case AMD_FW_DMCU_ISR:           fileName = "ISR display MCU"; break;
+        case AMD_FW_MSMU:               fileName = "Management SMU microcode"; break;
+        case AMD_FW_SPIROM_CFG:         fileName = "SPI ROM configuration"; break;
+        case AMD_FW_MPIO:               fileName = "MPIO firmware"; break;
+        case AMD_FW_TPMLITE:            fileName = "TPM lite"; break; // family 17h & 19h, family 15h & 16h: AMD_FW_PSP_SMUSCS "PSP SMU SCS"
+        case AMD_FW_DMCUB:              fileName = "Display MCU-B firmware"; break;
+        case AMD_FW_PSP_BOOTLOADER_AB:  fileName = "PSP recovery A/B bootloader"; break;
+        case AMD_RIB:                   fileName = "RoT image bundle"; break;
+        case AMD_FW_AMF_SRAM:           fileName = "AMF SRAM"; break;
+        case AMD_FW_AMF_DRAM:           fileName = "AMF DRAM"; break;
+        case AMD_FW_MFD_MPM:            fileName = "MFD MPM"; break;
+        case AMD_FW_AMF_WLAN:           fileName = "AMF WLAN"; break;
+        case AMD_FW_AMF_MFD:            fileName = "AMF MFD"; break;
+        case AMD_FW_MPDMA_TF:           fileName = "MPDMA test firmware"; break;
+        case AMD_TA_IKEK:               fileName = "TA IKeK"; break;
+        case AMD_FW_MPCCX:              fileName = "MPCCX"; break;
+        case AMD_FW_GMI3_PHY:           fileName = "GMI3 PHY"; break;
+        case AMD_FW_MPDMA_PM:           fileName = "MPDMA power management"; break;
+        case AMD_FW_LSDMA:              fileName = "LSDMA"; break;
+        case AMD_FW_C20_MP:             fileName = "C20 MP"; break;
+        case AMD_FW_FCFG_TABLE:         fileName = "Factory configuration"; break;
+        case AMD_FW_MINIMSMU:           fileName = "Mini-SMU"; break;
+        case AMD_FW_GFXIMU_0:           fileName = "GFX IMU 0"; break;
+        case AMD_FW_GFXIMU_1:           fileName = "GFX IMU 1"; break;
+        case AMD_FW_GFXIMU_2:           fileName = "GFX IMU 2"; break; // AMD_FW_SRAM_FW_EXT
+        case AMD_FW_TOS_WL_BIN:         fileName = "TOS whitelist"; break;
+        case AMD_FW_S3IMG:              fileName = "S3 image"; break;
+        case AMD_FW_UMSMU:              fileName = "Unified management SMU"; break;
+        case AMD_FW_USBDP:              fileName = "USB DisplayPort"; break;
+        case AMD_FW_USBSS:              fileName = "USB SuperSpeed"; break;
+        case AMD_FW_USB4:               fileName = "USB4"; break;
+        // BIOS types
+        case AMD_BIOS_SIG:              fileName = "BIOS signature"; break;
+        case AMD_BIOS_APCB:             fileName = "AMD Platform Configuration Block"; break;
+        case AMD_BIOS_APOB:             fileName = "AMD Platform Override Block"; break;
+        case AMD_BIOS_BIN:              fileName = "BIOS binary"; break;
+        case AMD_BIOS_APOB_NV:          fileName = "APOB non-volatile"; break;
+        case AMD_BIOS_PMUI:             fileName = "PMU firmware"; break;
+        case AMD_BIOS_PMUD:             fileName = "PMU data"; break;
+        case AMD_BIOS_UCODE:            fileName = "CPU microcode patch"; break;
+        case AMD_BIOS_FHP_DRIVER:       fileName = "FHP driver"; break;
+        case AMD_BIOS_APCB_BK:          fileName = "APCB backup"; break;
+        case AMD_BIOS_EARLY_VGA:        fileName = "Early video BIOS"; break;
+        case AMD_BIOS_MP2_CFG:          fileName = "MP2 configuration"; break;
+        case AMD_BIOS_PSP_SHARED_MEM:   fileName = "PSP shared memory descriptor"; break;
+        case AMD_BIOS_L2_PTR:           fileName = "BIOS L2 directory"; break;
+        // Unknown type
+        default:                        fileName = usprintf("unknown"); break;
     }
 
-    // Get Fsys store header
-    const APPLE_FSYS_STORE_HEADER* fsysStoreHeader = (const APPLE_FSYS_STORE_HEADER*)store.constData();
-
-    // Check store size
-    if (dataSize < fsysStoreHeader->Size) {
-        msg(QObject::tr("parseFsysStoreHeader: Fsys store size %1h (%2) is greater than volume body size %3h (%4)")
-            .hexarg(fsysStoreHeader->Size).arg(fsysStoreHeader->Size)
-            .hexarg(dataSize).arg(dataSize), parent);
-        return ERR_SUCCESS;
-    }
-
-    // Get parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
-    // Construct header and body
-    QByteArray header = store.left(sizeof(APPLE_FSYS_STORE_HEADER));
-    QByteArray body = store.mid(sizeof(APPLE_FSYS_STORE_HEADER), fsysStoreHeader->Size - sizeof(APPLE_FSYS_STORE_HEADER) - sizeof(UINT32));
-
-    // Check store checksum
-    UINT32 storedCrc = *(UINT32*)store.right(sizeof(UINT32)).constBegin();
-    UINT32 calculatedCrc = crc32(0, (const UINT8*)store.constData(), (const UINT32)store.size() - sizeof(UINT32));
-
-    // Add info
-    bool isGaidStore = (fsysStoreHeader->Signature == NVRAM_APPLE_GAID_STORE_SIGNATURE);
-    QString name = isGaidStore ? QObject::tr("Gaid store") : QObject::tr("Fsys store");
-    QString info = QObject::tr("Signature: %1\nFull size: %2h (%3)\nHeader size: %4h (%5)\nBody size: %6h (%7)\nUnknown0: %9h\nUnknown1: %10h\nCRC32: %11")
-        .arg(isGaidStore ? QObject::tr("Gaid") : QObject::tr("Fsys"))
-        .hexarg(fsysStoreHeader->Size).arg(fsysStoreHeader->Size)
-        .hexarg(header.size()).arg(header.size())
-        .hexarg(body.size()).arg(body.size())
-        .hexarg2(fsysStoreHeader->Unknown0, 2)
-        .hexarg2(fsysStoreHeader->Unknown1, 8)
-        .arg(storedCrc == calculatedCrc ? QObject::tr("%1h, valid").hexarg2(storedCrc, 8) : QObject::tr("%1h, invalid, should be %2h").hexarg2(storedCrc, 8).hexarg2(calculatedCrc, 8));
-
-    // Add correct offset
-    pdata.offset = parentOffset;
-
-    // Add tree item
-    index = model->addItem(Types::FsysStore, 0, name, QString(), info, header, body, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
-    return ERR_SUCCESS;
+    return fileName;
 }
 
-STATUS FfsParser::parseEvsaStoreHeader(const QByteArray & store, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+UINT32 FfsParser::pspDirectoryOffset(const UByteArray& amdImage, const UINT32 offset)
 {
-    const UINT32 dataSize = (const UINT32)store.size();
-
-    // Check dataSize
-    if (dataSize < sizeof(EVSA_STORE_ENTRY)) {
-        msg(QObject::tr("parseEvsaStoreHeader: volume body is too small even for EVSA store header"), parent);
-        return ERR_SUCCESS;
-    }
-
-    // Get EVSA store header
-    const EVSA_STORE_ENTRY* evsaStoreHeader = (const EVSA_STORE_ENTRY*)store.constData();
-
-    // Check store size
-    if (dataSize < evsaStoreHeader->StoreSize) {
-        msg(QObject::tr("parseEvsaStoreHeader: EVSA store size %1h (%2) is greater than volume body size %3h (%4)")
-            .hexarg(evsaStoreHeader->StoreSize).arg(evsaStoreHeader->StoreSize)
-            .hexarg(dataSize).arg(dataSize), parent);
-        return ERR_SUCCESS;
-    }
-
-    // Get parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
-    // Construct header and body
-    QByteArray header = store.left(evsaStoreHeader->Header.Size);
-    QByteArray body = store.mid(evsaStoreHeader->Header.Size, evsaStoreHeader->StoreSize - evsaStoreHeader->Header.Size);
-
-    // Recalculate checksum
-    UINT8 calculated = calculateChecksum8(((const UINT8*)evsaStoreHeader) + 2, evsaStoreHeader->Header.Size - 2);
-
-    // Add info
-    QString name = QObject::tr("EVSA store");
-    QString info = QObject::tr("Signature: EVSA\nFull size: %1h (%2)\nHeader size: %3h (%4)\nBody size: %5h (%6)\nType: %7h\nChecksum: %8\nAttributes: %9h")
-        .hexarg(evsaStoreHeader->StoreSize).arg(evsaStoreHeader->StoreSize)
-        .hexarg(header.size()).arg(header.size())
-        .hexarg(body.size()).arg(body.size())
-        .hexarg2(evsaStoreHeader->Header.Type, 2)
-        .arg(evsaStoreHeader->Header.Checksum == calculated ?
-            QObject::tr("%1h, valid").hexarg2(calculated, 2) :
-            QObject::tr("%1h, invalid, should be %2h").hexarg2(evsaStoreHeader->Header.Checksum, 2).hexarg2(calculated, 2))
-        .hexarg2(evsaStoreHeader->Attributes, 8);
-
-    // Add correct offset
-    pdata.offset = parentOffset;
-
-    // Add tree item
-    index = model->addItem(Types::EvsaStore, 0, name, QString(), info, header, body, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
-    return ERR_SUCCESS;
+    AMD_ADDRESS_ADDRESSMODE am;
+    am.Address = offset;
+    am.AddrMode = AMD_ADDR_PHYSICAL;
+    return pspFileOffset(amdImage, 0, 0, 4, am);
 }
 
-STATUS FfsParser::parseFlashMapStoreHeader(const QByteArray & store, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+UINT32 FfsParser::pspFileOffset(const UByteArray& amdImage, const UINT32 offset, const UINT32 entryOffset,
+    const UINT32 size, const AMD_ADDRESS_ADDRESSMODE& addressMode)
 {
-    const UINT32 dataSize = (const UINT32)store.size();
-
-    // Check data size
-    if (dataSize < sizeof(PHOENIX_FLASH_MAP_HEADER)) {
-        msg(QObject::tr("parseFlashMapStoreHeader: volume body is too small even for FlashMap block header"), parent);
-        return ERR_SUCCESS;
+    // Since we are operating on the BIOS/bank image, physical address is converted relative to the start of the BIOS/bank image.
+    UINT64 addr = addressMode.Address;
+    if (addr >= UINT32_MAX || size < 4 || size == UINT32_MAX)
+        return UINT32_MAX;
+    switch (addressMode.AddrMode) {
+        case AMD_ADDR_PHYSICAL:
+            // CPU physical
+            if (addr >= pspSpiRomBase && addr < UINT32_MAX)
+                addr -= pspSpiRomBase;
+            break;
+        case AMD_ADDR_REL_TABLE:
+            // relative to table = parent of an entry (slot)
+            addr += offset;
+            break;
+        case AMD_ADDR_REL_SLOT:
+            // relative to an entry (slot)
+            addr += entryOffset;
+            break;
+        default: // same as case AMD_ADDR_REL_BIOS:
+            // relative to a BIOS/bank image
+            break;
     }
 
-    // Get FlashMap block header
-    const PHOENIX_FLASH_MAP_HEADER* flashMapHeader = (const PHOENIX_FLASH_MAP_HEADER*)store.constData();
+    if (pspMaxOffset < addr + size)
+        pspMaxOffset = addr + size;
 
-    // Check store size
-    UINT32 flashMapSize = sizeof(PHOENIX_FLASH_MAP_HEADER) + flashMapHeader->NumEntries * sizeof(PHOENIX_FLASH_MAP_ENTRY);
-    if (dataSize < flashMapSize) {
-        msg(QObject::tr("parseFlashMapStoreHeader: FlashMap block size %1h (%2) is greater than volume body size %3h (%4)")
-            .hexarg(flashMapSize).arg(flashMapSize)
-            .hexarg(dataSize).arg(dataSize), parent);
-        return ERR_SUCCESS;
-    }
+    if (addr > amdImage.size())
+        return UINT32_MAX;
 
-    // Get parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
-    // Construct header and body
-    QByteArray header = store.left(sizeof(PHOENIX_FLASH_MAP_HEADER));
-    QByteArray body = store.mid(sizeof(PHOENIX_FLASH_MAP_HEADER), flashMapSize - sizeof(PHOENIX_FLASH_MAP_HEADER));
-
-    // Add info
-    QString name = QObject::tr("Phoenix SCT flash map");
-    QString info = QObject::tr("Signature: _FLASH_MAP\nFull size: %1h (%2)\nHeader size: %3h (%4)\nBody size: %5h (%6)\nNumber of entries: %7")
-        .hexarg(flashMapSize).arg(flashMapSize)
-        .hexarg(header.size()).arg(header.size())
-        .hexarg(body.size()).arg(body.size())
-        .arg(flashMapHeader->NumEntries);
-
-    // Add correct offset
-    pdata.offset = parentOffset;
-
-    // Add tree item
-    index = model->addItem(Types::FlashMapStore, 0, name, QString(), info, header, body, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
-    return ERR_SUCCESS;
+    return (UINT32)addr;
 }
 
-STATUS FfsParser::parseCmdbStoreHeader(const QByteArray & store, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+USTATUS FfsParser::decompressBios(const UByteArray& fileImage, UByteArray& decompressed)
 {
-    const UINT32 dataSize = (const UINT32)store.size();
-    
-    // Check store size
-    if (dataSize < sizeof(PHOENIX_CMDB_HEADER)) {
-        msg(QObject::tr("parseCmdbStoreHeader: volume body is too small even for CMDB store header"), parent);
-        return ERR_SUCCESS;
+    USTATUS result;
+
+    if (fileImage.size() < 256) {
+        return U_BUFFER_TOO_SMALL;
+    }
+    result = zlibDecompress(fileImage.mid(256, fileImage.size() - 256), decompressed);
+    if (result) {
+        return result;
     }
 
-    UINT32 cmdbSize = NVRAM_PHOENIX_CMDB_SIZE;
-    if (dataSize < cmdbSize) {
-        msg(QObject::tr("parseCmdbStoreHeader: CMDB store size %1h (%2) is greater than volume body size %3h (%4)")
-            .hexarg(cmdbSize).arg(cmdbSize)
-            .hexarg(dataSize).arg(dataSize), parent);
-        return ERR_SUCCESS;
-    }
-
-    // Get store header
-    const PHOENIX_CMDB_HEADER* cmdbHeader = (const PHOENIX_CMDB_HEADER*)store.constData();
-
-    // Get parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
-    // Construct header and body
-    QByteArray header = store.left(cmdbHeader->TotalSize);
-    QByteArray body = store.mid(cmdbHeader->TotalSize, cmdbSize - cmdbHeader->TotalSize);
-
-    // Add info
-    QString name = QObject::tr("CMDB store");
-    QString info = QObject::tr("Signature: CMDB\nFull size: %1h (%2)\nHeader size: %3h (%4)\nBody size: %5h (%6)")
-        .hexarg(cmdbSize).arg(cmdbSize)
-        .hexarg(header.size()).arg(header.size())
-        .hexarg(body.size()).arg(body.size());
-
-    // Add correct offset
-    pdata.offset = parentOffset;
-
-    // Add tree item
-    index = model->addItem(Types::CmdbStore, 0, name, QString(), info, header, body, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
-    return ERR_SUCCESS;
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseSlicPubkeyHeader(const QByteArray & store, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+USTATUS FfsParser::pspParseISHDirectory(const UByteArray& amdImage, const UINT32 offset, const UModelIndex& parent, UModelIndex& index, const bool probe)
 {
-    const UINT32 dataSize = (const UINT32)store.size();
+    if (offset + sizeof(AMD_ISH_DIRECTORY_TABLE) > amdImage.size())
+        return U_BUFFER_TOO_SMALL;
 
-    // Check data size
-    if (dataSize < sizeof(OEM_ACTIVATION_PUBKEY)) {
-        msg(QObject::tr("parseSlicPubkeyHeader: volume body is too small even for SLIC pubkey header"), parent);
-        return ERR_SUCCESS;
+    // Parse ISH table
+    const AMD_ISH_DIRECTORY_TABLE* tbl = (const AMD_ISH_DIRECTORY_TABLE*)(amdImage.constData() + offset);
+    const UINT32 length = sizeof(AMD_ISH_DIRECTORY_TABLE);
+
+    // Checksum starts right after checksum field
+    const UINT32 checksumOffset = offsetof(AMD_ISH_DIRECTORY_TABLE, Checksum) + sizeof(AMD_ISH_DIRECTORY_TABLE::Checksum); // Start after checksum field
+    UByteArray data = amdImage.mid(offset + checksumOffset, length - checksumOffset);
+    const UINT32 checksum = fletcher32(data);
+    if (checksum != tbl->Checksum) {
+        if (!probe)
+            msg(usprintf("%s: ISH directory table at offset %Xh checksum is invalid", __FUNCTION__, offset), parent);
     }
 
-    // Get SLIC pubkey header
-    const OEM_ACTIVATION_PUBKEY* pubkeyHeader = (const OEM_ACTIVATION_PUBKEY*)store.constData();
-
-    // Check store size
-    if (dataSize < pubkeyHeader->Size) {
-        msg(QObject::tr("parseSlicPubkeyHeader: SLIC pubkey size %1h (%2) is greater than volume body size %3h (%4)")
-            .hexarg(pubkeyHeader->Size).arg(pubkeyHeader->Size)
-            .hexarg(dataSize).arg(dataSize), parent);
-        return ERR_SUCCESS;
+    const UINT32 dirOffset = pspDirectoryOffset(amdImage, tbl->L2Address);
+    if (checksum != tbl->Checksum && dirOffset == UINT32_MAX) {
+        if (!probe)
+            msg(usprintf("%s: unknown directory table at offset %Xh", __FUNCTION__, offset), parent);
+        return U_INVALID_PARAMETER;
     }
 
-    // Get parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
+    // Add ISH directory image tree item
+    USTATUS result;
+    if (!probe) {
+        const UString dirName = "ISH directory table";
+        if (model->type(parent) == Types::DirectoryTableEntry)
+            model->setName(parent, model->name(parent) + dirName);
+        const UString baseInfo = dirOffset < UINT32_MAX ? usprintf("base: %Xh\n", offsetToBase(parent, dirOffset)) : "invalid\n";
+        UString details = usprintf("Checksum: %08Xh, ", tbl->Checksum)
+            + (checksum == tbl->Checksum ? "valid\n" : usprintf("invalid, should be %08Xh\n", checksum))
+            + usprintf("PSP L2 location: %Xh, ", tbl->L2Address) + baseInfo;
+        details += usprintf("Boot priority: %08Xh (%s)\nSlot max size: %Xh (%u)\nPspId: %08Xh\n",
+            tbl->BootPriority, tbl->BootPriority == 0xFFFFFFFF ? " (primary)" : tbl->BootPriority == 1 ? " (secondary)" : "",
+            tbl->SlotMaxSize, tbl->SlotMaxSize,
+            tbl->PspId);
+        result = insertByRange(offset, Types::DirectoryTable, Subtypes::ISHDirectory,
+            dirName, UString(), details,
+            0, length, 0,
+            parent, index);
+        if (result != U_SUCCESS && result != U_DIR_ALREADY_EXIST)
+            return result;
+        if (result == U_DIR_ALREADY_EXIST)
+            return U_SUCCESS;
+    }
 
-    // Construct header and body
-    QByteArray header = store.left(sizeof(OEM_ACTIVATION_PUBKEY));
+    if (dirOffset < UINT32_MAX) {
+        // Add PSP L2 directory tree item
+        UModelIndex childIndex;
+        result = pspParseDirectory(amdImage, dirOffset, Subtypes::PSPDirectory, index, childIndex, probe);
+        if (result != U_SUCCESS) {
+            if (!probe)
+                msg(usprintf("%s: failed to parse PSP directory table pointed to by ISH directory table", __FUNCTION__), index);
+            return result;
+        }
+    }
+    else {
+        if (!probe)
+            msg(usprintf("%s: PSP directory table location (%Xh) is invalid", __FUNCTION__, tbl->L2Address), parent);
+    }
 
-    // Add info
-    QString name = QObject::tr("SLIC pubkey");
-    QString info = QObject::tr("Type: 0h\nFull size: %1h (%2)\nHeader size: %3h (%4)\nBody size: 0h (0)\n"
-        "Key type :%5h\nVersion: %6h\nAlgorithm: %7h\nMagic: RSA1\nBit length: %8h\nExponent:%9h")
-        .hexarg(pubkeyHeader->Size).arg(pubkeyHeader->Size)
-        .hexarg(header.size()).arg(header.size())
-        .hexarg2(pubkeyHeader->KeyType, 2)
-        .hexarg2(pubkeyHeader->Version, 2)
-        .hexarg2(pubkeyHeader->Algorithm, 8)
-        .hexarg2(pubkeyHeader->BitLength, 8)
-        .hexarg2(pubkeyHeader->Exponent, 8);
-
-    // Add correct offset
-    pdata.offset = parentOffset;
-
-    // Add tree item
-    index = model->addItem(Types::SlicData, Subtypes::PubkeySlicData, name, QString(), info, header, QByteArray(), QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
-    return ERR_SUCCESS;
+    return U_SUCCESS;
 }
 
-STATUS FfsParser::parseSlicMarkerHeader(const QByteArray & store, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
+USTATUS FfsParser::pspParseComboEntries(const UByteArray& amdImage, const UINT32 offset, const UINT32 headerSize, const UINT32 numEntries,
+    const UModelIndex & parent, UModelIndex & index, const bool probe)
 {
-    const UINT32 dataSize = (const UINT32)store.size();
+    const Subtypes::DirectorySubtypes type = Subtypes::ComboDirectory;
 
-    // Check data size
-    if (dataSize < sizeof(OEM_ACTIVATION_MARKER)) {
-        msg(QObject::tr("parseSlicMarkerHeader: volume body is too small even for SLIC marker header"), parent);
-        return ERR_SUCCESS;
-    }
+    for (int i = 0; i < numEntries; i++) {
+        USTATUS result = U_ELEMENTS_NOT_FOUND;
+        const UINT32 entryOffset = offset + headerSize + i * sizeof(AMD_PSP_COMBO_ENTRY);
+        const AMD_PSP_COMBO_ENTRY& e = *(AMD_PSP_COMBO_ENTRY*)(amdImage.constData() + entryOffset);
 
-    // Get SLIC marker header
-    const OEM_ACTIVATION_MARKER* markerHeader = (const OEM_ACTIVATION_MARKER*)store.constData();
+        // Add PSP table entry image tree item
+        UString entryText;
+        UModelIndex childIndex;
+        const UINT32 dirOffset = pspDirectoryOffset(amdImage, e.L2Address);
+        if (!probe) {
+            const UString baseInfo = dirOffset < UINT32_MAX ? usprintf("base: %Xh\n", offsetToBase(parent, dirOffset)) : "invalid\n";
+            const UString entryInfo = usprintf("Id select: %08Xh (by %sId)\nId: %08Xh\nL2 location: %Xh, ",
+                e.IdSel, e.IdSel ? "Family" : "Psp", e.Id, e.L2Address) + baseInfo;
+            entryText = usprintf("%sId %08Xh", e.IdSel == 0 ? "Psp" : "Family", e.Id);
+            childIndex = model->addItem(
+                entryOffset - offset, Types::DirectoryTableEntry, type,
+                usprintf("%u - ", i + 1), entryText, entryInfo,
+                UByteArray(), amdImage.mid(entryOffset, sizeof(AMD_PSP_COMBO_ENTRY)), UByteArray(),
+                Fixed, parent);
+        }
+        UModelIndex entryIndex = childIndex;
+        if (dirOffset < UINT32_MAX) {
+            result = pspParseDirectory(amdImage, dirOffset, Subtypes::AnyDirectory, entryIndex, childIndex, probe);
 
-    // Check store size
-    if (dataSize < markerHeader->Size) {
-        msg(QObject::tr("parseSlicMarkerHeader: SLIC marker size %1h (%2) is greater than volume body size %3h (%4)")
-            .hexarg(markerHeader->Size).arg(markerHeader->Size)
-            .hexarg(dataSize).arg(dataSize), parent);
-        return ERR_SUCCESS;
-    }
-
-    // Get parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
-    // Construct header and body
-    QByteArray header = store.left(sizeof(OEM_ACTIVATION_MARKER));
-
-    // Add info
-    QString name = QObject::tr("SLIC marker");
-    QString info = QObject::tr("Type: 1h\nFull size: %1h (%2)\nHeader size: %3h (%4)\nBody size: 0h (0)\n"
-        "Version :%5h\nOEM ID: %6\nOEM table ID: %7\nWindows flag: WINDOWS\nSLIC version: %8h")
-        .hexarg(markerHeader->Size).arg(markerHeader->Size)
-        .hexarg(header.size()).arg(header.size())
-        .hexarg2(markerHeader->Version, 8)
-        .arg(QString::fromLatin1((const char*)&(markerHeader->OemId), sizeof(markerHeader->OemId)))
-        .arg(QString::fromLatin1((const char*)&(markerHeader->OemTableId), sizeof(markerHeader->OemTableId)))
-        .hexarg2(markerHeader->SlicVersion, 8);
-
-    // Add correct offset
-    pdata.offset = parentOffset;
-
-    // Add tree item
-    index = model->addItem(Types::SlicData, Subtypes::MarkerSlicData, name, QString(), info, header, QByteArray(), QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
-    return ERR_SUCCESS;
-}
-
-STATUS FfsParser::parseIntelMicrocodeHeader(const QByteArray & store, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
-{
-    const UINT32 dataSize = (const UINT32)store.size();
-
-    // Check data size
-    if (dataSize < sizeof(INTEL_MICROCODE_HEADER)) {
-        msg(QObject::tr("parseIntelMicrocodeHeader: volume body is too small even for Intel microcode header"), parent);
-        return ERR_SUCCESS;
-    }
-
-    // Get Intel microcode header
-    const INTEL_MICROCODE_HEADER* ucodeHeader = (const INTEL_MICROCODE_HEADER*)store.constData();
-
-    // Check store size
-    if (dataSize < ucodeHeader->TotalSize) {
-        msg(QObject::tr("parseIntelMicrocodeHeader: Intel microcode size %1h (%2) is greater than volume body size %3h (%4)")
-            .hexarg(ucodeHeader->TotalSize).arg(ucodeHeader->TotalSize)
-            .hexarg(dataSize).arg(dataSize), parent);
-        return ERR_SUCCESS;
-    }
-
-    // Get parsing data
-    PARSING_DATA pdata = parsingDataFromQModelIndex(parent);
-
-    // Construct header and body
-    QByteArray header = store.left(sizeof(INTEL_MICROCODE_HEADER));
-    QByteArray body = store.mid(sizeof(INTEL_MICROCODE_HEADER), ucodeHeader->DataSize);
-
-    //TODO: recalculate checksum
-
-    // Add info
-    QString name = QObject::tr("Intel microcode");
-    QString info = QObject::tr("Revision: 1h\nFull size: %1h (%2)\nHeader size: %3h (%4)\nBody size: %5h (%6)\n"
-        "Date: %7h\nCPU signature: %8h\nChecksum: %9h\nLoader revision: %10h\nCPU flags: %11h")
-        .hexarg(ucodeHeader->TotalSize).arg(ucodeHeader->TotalSize)
-        .hexarg(header.size()).arg(header.size())
-        .hexarg(body.size()).arg(body.size())
-        .hexarg2(ucodeHeader->Date, 8)
-        .hexarg2(ucodeHeader->CpuSignature, 8)
-        .hexarg2(ucodeHeader->Checksum, 8)
-        .hexarg2(ucodeHeader->LoaderRevision, 8)
-        .hexarg2(ucodeHeader->CpuFlags, 8);
-
-    // Add correct offset
-    pdata.offset = parentOffset;
-
-    // Add tree item
-    index = model->addItem(Types::Microcode, Subtypes::IntelMicrocode, name, QString(), info, header, body, QByteArray(), true, parsingDataToQByteArray(pdata), parent);
-
-    return ERR_SUCCESS;
-}
-
-STATUS FfsParser::parseStoreHeader(const QByteArray & store, const UINT32 parentOffset, const QModelIndex & parent, QModelIndex & index)
-{
-    const UINT32 dataSize = (const UINT32)store.size();
-    const UINT32* signature = (const UINT32*)store.constData();
-    // Check store size
-    if (dataSize < sizeof(UINT32)) {
-        msg(QObject::tr("parseStoreHeader: volume body is too small even for store signature"), parent);
-        return ERR_SUCCESS;
-    }
-
-    // Check signature and run parser function needed
-    // VSS/SVS store
-    if (*signature == NVRAM_VSS_STORE_SIGNATURE || *signature == NVRAM_APPLE_SVS_STORE_SIGNATURE) 
-        return parseVssStoreHeader(store, parentOffset, parent, index);
-    // FTW store
-    else if (*signature == NVRAM_MAIN_STORE_VOLUME_GUID_DATA1 || *signature == EDKII_WORKING_BLOCK_SIGNATURE_GUID_DATA1) 
-        return parseFtwStoreHeader(store, parentOffset, parent, index);
-    // FDC store
-    else if (*signature == NVRAM_FDC_VOLUME_SIGNATURE) 
-        return parseFdcStoreHeader(store, parentOffset, parent, index);
-    // Apple Fsys/Gaid store
-    else if (*signature == NVRAM_APPLE_FSYS_STORE_SIGNATURE || *signature == NVRAM_APPLE_GAID_STORE_SIGNATURE) 
-        return parseFsysStoreHeader(store, parentOffset, parent, index);
-    // EVSA store
-    else if (*(signature + 1) == NVRAM_EVSA_STORE_SIGNATURE) 
-        return parseEvsaStoreHeader(store, parentOffset, parent, index);
-    // Phoenix SCT flash map
-    else if (*signature == NVRAM_PHOENIX_FLASH_MAP_SIGNATURE_PART1) 
-        return parseFlashMapStoreHeader(store, parentOffset, parent, index);
-    // Phoenix CMDB store
-    else if (*signature == NVRAM_PHOENIX_CMDB_HEADER_SIGNATURE) 
-        return parseCmdbStoreHeader(store, parentOffset, parent, index);
-    // SLIC pubkey
-    else if (*(signature + 4) == OEM_ACTIVATION_PUBKEY_MAGIC)
-        return parseSlicPubkeyHeader(store, parentOffset, parent, index);
-    // SLIC marker
-    else if (*(const UINT64*)(store.constData() + 26) == OEM_ACTIVATION_MARKER_WINDOWS_FLAG)
-        return parseSlicMarkerHeader(store, parentOffset, parent, index);
-    // Intel microcode
-    // Must be checked after SLIC marker because of the same *signature values
-    else if (*signature == INTEL_MICROCODE_HEADER_VERSION)
-        return parseIntelMicrocodeHeader(store, parentOffset, parent, index);
-
-    msg(QObject::tr("parseStoreHeader: don't know how to parse a header with signature %1h").hexarg2(*signature, 8), parent);
-    return ERR_SUCCESS;
-}
-
-STATUS FfsParser::parseVssStoreBody(const QModelIndex & index)
-{
-    // Sanity check
-    if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
-    // Get parsing data for the current item
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-    UINT32 parentOffset = pdata.offset + model->header(index).size();
-    const QByteArray data = model->body(index);
-
-    // Check that the is enough space for variable header
-    const UINT32 dataSize = (UINT32)data.size();
-    if (dataSize < sizeof(VSS_VARIABLE_HEADER)) {
-        msg(QObject::tr("parseVssStoreBody: store body is too small even for VSS variable header"), index);
-        return ERR_SUCCESS;
-    }
-    
-    UINT32 offset = 0;
-
-    // Parse all variables
-    while (1) {
-        bool isInvalid = false;
-        bool isAuthenticated = false;
-        bool isAppleCrc32 = false;
-        
-        UINT32 storedCrc32 = 0;
-        UINT32 calculatedCrc32 = 0;
-        UINT64 monotonicCounter = 0;
-        EFI_TIME timestamp = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-        UINT32 pubKeyIndex = 0;
-
-        UINT8 subtype = 0;
-        QString name;
-        QString text;
-        EFI_GUID* variableGuid;
-        CHAR16*   variableName;
-        QByteArray header;
-        QByteArray body;
-
-        UINT32 unparsedSize = dataSize - offset;
-
-        // Get variable header
-        const VSS_VARIABLE_HEADER* variableHeader = (const VSS_VARIABLE_HEADER*)(data.constData() + offset);
-
-        // Check variable header to fit in still unparsed data
-        UINT32 variableSize = 0;
-        if (unparsedSize >= sizeof(VSS_VARIABLE_HEADER) 
-            && variableHeader->StartId == NVRAM_VSS_VARIABLE_START_ID) {
-
-            // Apple VSS variable with CRC32 of the data  
-            if (variableHeader->Attributes & NVRAM_VSS_VARIABLE_APPLE_DATA_CHECKSUM) {
-                isAppleCrc32 = true;
-                if (unparsedSize < sizeof(VSS_APPLE_VARIABLE_HEADER)) {
-                    variableSize = 0;
-                }
+            if (!probe) {
+                if (result != U_SUCCESS)
+                    msg(usprintf("%s: failed to parse directory table pointed to by Combo directory table (entry %u)", __FUNCTION__, i + 1), entryIndex);
                 else {
-                    const VSS_APPLE_VARIABLE_HEADER* appleVariableHeader = (const VSS_APPLE_VARIABLE_HEADER*)variableHeader;
-                    variableSize = sizeof(VSS_APPLE_VARIABLE_HEADER) + appleVariableHeader->NameSize + appleVariableHeader->DataSize;
-                    variableGuid = (EFI_GUID*)&appleVariableHeader->VendorGuid;
-                    variableName = (CHAR16*)(appleVariableHeader + 1);
-
-                    header = data.mid(offset, sizeof(VSS_APPLE_VARIABLE_HEADER) + appleVariableHeader->NameSize);
-                    body = data.mid(offset + header.size(), appleVariableHeader->DataSize);
-
-                    // Calculate CRC32 of the variable data
-                    storedCrc32 = appleVariableHeader->DataCrc32;
-                    calculatedCrc32 = crc32(0, (const UINT8*)body.constData(), body.size());
+                    UString itemText = model->text(childIndex);
+                    model->setText(childIndex, itemText.isEmpty() ? entryText : itemText + ", " + entryText);
                 }
-            }
-
-            // Authenticated variable
-            else if ((variableHeader->Attributes & NVRAM_VSS_VARIABLE_AUTHENTICATED_WRITE_ACCESS)
-                || (variableHeader->Attributes & NVRAM_VSS_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS)
-                || (variableHeader->Attributes & NVRAM_VSS_VARIABLE_APPEND_WRITE)
-                || (variableHeader->NameSize == 0 && variableHeader->DataSize == 0)) { // If both NameSize and DataSize are zeros, it's auth variable with zero montonic counter
-                isAuthenticated = true;
-                if (unparsedSize < sizeof(VSS_AUTH_VARIABLE_HEADER)) {
-                    variableSize = 0;
-                }
-                else {
-                    const VSS_AUTH_VARIABLE_HEADER* authVariableHeader = (const VSS_AUTH_VARIABLE_HEADER*)variableHeader;
-                    variableSize = sizeof(VSS_AUTH_VARIABLE_HEADER) + authVariableHeader->NameSize + authVariableHeader->DataSize;
-                    variableGuid = (EFI_GUID*)&authVariableHeader->VendorGuid;
-                    variableName = (CHAR16*)(authVariableHeader + 1);
-
-                    header = data.mid(offset, sizeof(VSS_AUTH_VARIABLE_HEADER) + authVariableHeader->NameSize);
-                    body = data.mid(offset + header.size(), authVariableHeader->DataSize);
-
-                    monotonicCounter = authVariableHeader->MonotonicCounter;
-                    timestamp = authVariableHeader->Timestamp;
-                    pubKeyIndex = authVariableHeader->PubKeyIndex;
-                }
-            }
-            
-            // Normal VSS variable
-            if (!isAuthenticated && !isAppleCrc32) {
-                variableSize = sizeof(VSS_VARIABLE_HEADER) + variableHeader->NameSize + variableHeader->DataSize;
-                variableGuid = (EFI_GUID*)&variableHeader->VendorGuid;
-                variableName = (CHAR16*)(variableHeader + 1);
-
-                header = data.mid(offset, sizeof(VSS_VARIABLE_HEADER) + variableHeader->NameSize);
-                body = data.mid(offset + header.size(), variableHeader->DataSize);
-            }
-
-            // There is also a case of authenticated Apple variables, but I haven't seen one yet
-
-            // Check variable state
-            if (variableHeader->State != NVRAM_VSS_VARIABLE_ADDED && variableHeader->State != NVRAM_VSS_VARIABLE_HEADER_VALID) {
-                isInvalid = true;
             }
         }
+        else {
+            if (!probe)
+                msg(usprintf("%s: directory table location (%Xh) pointed to by Combo directory table (entry %u) is invalid", __FUNCTION__, offset, i + 1), entryIndex);
+        }
+        if (result != U_SUCCESS)
+            if (!probe)
+                model->setName(entryIndex, model->name(entryIndex) + ": unknown directory table");
+    }
+    return U_SUCCESS;
+}
 
-        // Can't parse further, add the last element and break the loop
-        if (!variableSize) {
-            // Check if the data left is a free space or a padding
-            QByteArray padding = data.mid(offset, unparsedSize);
-            UINT8 type;
+USTATUS FfsParser::pspParseBIOSEntries(const UByteArray& amdImage, const UINT32 offset, const UINT32 headerSize, const UINT32 numEntries,
+    const UModelIndex & parent, UModelIndex & index, const bool probe)
+{
+    const Subtypes::DirectorySubtypes type = Subtypes::BIOSDirectory;
 
-            if (padding.count(pdata.emptyByte) == padding.size()) {
-                // It's a free space
-                name = QObject::tr("Free space");
-                type = Types::FreeSpace;
-                subtype = 0;
+    for (int i = 0; i < numEntries; i++) {
+        USTATUS result;
+        const UINT32 entryOffset = offset + headerSize + i * sizeof(AMD_BIOS_DIRECTORY_ENTRY);
+        const AMD_BIOS_DIRECTORY_ENTRY& e = *(AMD_BIOS_DIRECTORY_ENTRY*)(amdImage.constData() + entryOffset);
+
+        const UString fileName = pspFileName(e.Type, e.SubProgram);
+        const UINT32 fileOffset = pspFileOffset(amdImage, offset, entryOffset, e.Size, e.AddressMode);
+        // Add BIOS table entry image tree item
+        UModelIndex childIndex;
+        if (!probe) {
+            const UString baseInfo = fileOffset < UINT32_MAX ? usprintf("base: %Xh\n", offsetToBase(parent, fileOffset)) : "invalid\n";
+            UString entryInfo = usprintf("Type: %02Xh\nRegion type: %02Xh\nFlags: %04Xh\n"
+                "  SubProgram: %01Xh\n  Instance: %01Xh\n  RomId: %01Xh\n  Reset-image: %s\n"
+                "  Copy image: %s\n  Read only: %s\n  Writable: %s\n  Compressed: %s\n"
+                "File size: %Xh (%u)\nFile location: %" PRIX64 "h, ",
+                    e.Type, e.RegionType, e.Flags.raw,
+                    e.SubProgram, e.Instance, e.RomId,
+                    (e.ResetImage) ? "true" : "false",
+                    (e.CopyImage) ? "true" : "false",
+                    (e.ReadOnly) ? "true" : "false",
+                    (e.Writable) ? "true" : "false",
+                    (e.Compressed) ? "true" : "false",
+                    e.Size, e.Size, e.Address) + baseInfo;
+            entryInfo += usprintf("Address mode: %01Xh\nDestination: %" PRIX64 "h\n", (UINT8)e.AddrMode, e.Destination);
+            const UString entryText = usprintf("Type %02Xh", e.Type)
+                + (e.SubProgram ? usprintf(", SubProgram %Xh", e.SubProgram) : "")
+                + (e.Instance ? usprintf(", Instance %01Xh", e.Instance) : "");
+            childIndex = model->addItem(entryOffset - offset, Types::DirectoryTableEntry, type,
+                usprintf("%d - ", i + 1), entryText, entryInfo,
+                UByteArray(), amdImage.mid(entryOffset, sizeof(AMD_BIOS_DIRECTORY_ENTRY)), UByteArray(),
+                Fixed, parent);
+        }
+        const UModelIndex entryIndex = childIndex;
+
+        UString nameTail = fileName + ((e.SubProgram != 0 || e.Instance != 0)
+            ? usprintf(" (%X:%01X)", e.SubProgram, e.Instance) : "");
+        if (fileOffset == UINT32_MAX) {
+            if (!probe)
+                msg(usprintf("%s: invalid location (%0" PRIX64 "h) or mode (%01Xh) for file: ", __FUNCTION__, e.Address, (UINT8)e.AddrMode) + fileName, entryIndex);
+        }
+        else {
+            switch (e.Type) {
+                case AMD_BIOS_L2_PTR:
+                    result = pspParseDirectory(amdImage, fileOffset, Subtypes::BIOSDirectory, entryIndex, childIndex, probe);
+                    if (result == U_SUCCESS)
+                        nameTail.clear();
+                    break;
+                // BIOS directory regular file
+                default:
+                    pspFilesList.push_back({ fileOffset, e.Size, model->base(entryIndex), fileName, e.Flags.raw,
+                        e.Type, (UINT8)e.SubProgram, (UINT8)e.Instance, (UINT8)e.RomId, (UINT8)e.Writable, 1,
+                        (UINT8)e.ResetImage, (UINT8)e.CopyImage, (UINT8)e.ReadOnly, (UINT8)e.Compressed, e.RegionType, e.Destination });
+                    result = U_SUCCESS;
+                    break;
+            }
+            if (result != U_SUCCESS) {
+                if (!probe)
+                    msg(usprintf("%s: failed to parse BIOS directory file: ", __FUNCTION__) + fileName, entryIndex);
+            }
+        }
+        if (!nameTail.isEmpty())
+            if (!probe)
+                model->setName(entryIndex, model->name(entryIndex) + nameTail);
+
+    }
+
+    return U_SUCCESS;
+}
+
+USTATUS FfsParser::pspParsePSPEntries(const UByteArray& amdImage, const UINT32 offset, const UINT32 headerSize, const UINT32 numEntries,
+    const UModelIndex & parent, UModelIndex & index, const bool probe)
+{
+    const Subtypes::DirectorySubtypes type = Subtypes::PSPDirectory;
+
+    for (int i = 0; i < numEntries; i++) {
+        USTATUS result;
+        const UINT32 entryOffset = offset + headerSize + i * sizeof(AMD_PSP_DIRECTORY_ENTRY);
+        const AMD_PSP_DIRECTORY_ENTRY& e = *(AMD_PSP_DIRECTORY_ENTRY*)(amdImage.constData() + entryOffset);
+
+        const UString fileName = pspFileName(e.Type, e.SubProgram);
+        const UINT32 fileOffset = pspFileOffset(amdImage, offset, entryOffset, e.Size, e.AddressMode);
+        // Add PSP table entry image tree item
+        UModelIndex childIndex;
+        if (!probe) {
+            const UString baseInfo = fileOffset < UINT32_MAX ? usprintf("base: %Xh\n", offsetToBase(parent, fileOffset)) : "invalid\n";
+            UString entryInfo = usprintf("Type: %02Xh\nSubProgram: %02Xh\nFlags: %04Xh\n"
+                "  Instance: %01Xh\n  RomId: %01Xh\n  Writable: %s\n"
+                "File size: %Xh (%u)\nFile location: %" PRIX64 "h, ",
+                    e.Type, e.SubProgram, e.Flags.raw,
+                    e.Instance, e.RomId, (e.Writable) ? "true" : "false",
+                    e.Size, e.Size, e.Address) + baseInfo;
+            entryInfo += usprintf("Address mode: %01Xh\n", (UINT8)e.AddrMode);
+            const UString entryText = usprintf("Type %02Xh", e.Type)
+                + (e.SubProgram ? usprintf(", SubProgram %Xh", e.SubProgram) : "")
+                + (e.Instance ? usprintf(", Instance %01Xh", e.Instance) : "");
+            childIndex = model->addItem(entryOffset - offset, Types::DirectoryTableEntry, type,
+                usprintf("%d - ", i + 1), entryText, entryInfo,
+                UByteArray(), amdImage.mid(entryOffset, sizeof(AMD_PSP_DIRECTORY_ENTRY)), UByteArray(),
+                Fixed, parent);
+        }
+        const UModelIndex entryIndex = childIndex;
+
+        UString nameTail = fileName + ((e.SubProgram != 0 || e.Instance != 0)
+            ? usprintf(" (%X:%01X)", e.SubProgram, e.Instance) : "");
+        if (fileOffset == UINT32_MAX) {
+            if (!probe)
+                msg(usprintf("%s: invalid location (%0" PRIX64 "h) or mode (%01Xh) for file: ", __FUNCTION__, e.Address, (UINT8)e.AddrMode) + fileName, entryIndex);
+        }
+        else {
+            switch (e.Type) {
+                // Special files - tables
+                case AMD_FW_L2_PTR:
+                case AMD_FW_RECOVERYAB_A:
+                case AMD_FW_RECOVERYAB_B:
+                    // Can be a PSP directory or ISH table
+                    result = pspParseDirectory(amdImage, fileOffset, Subtypes::PSPDirectory, entryIndex, childIndex, probe);
+                    if (result != U_SUCCESS && e.Type != AMD_FW_L2_PTR)
+                        result = pspParseISHDirectory(amdImage, fileOffset, entryIndex, childIndex, probe);
+                    if (result == U_SUCCESS)
+                        nameTail.clear();
+                    break;
+                case AMD_FW_BIOS_TABLE:
+                    result = pspParseDirectory(amdImage, fileOffset, Subtypes::BIOSDirectory, entryIndex, childIndex, probe);
+                    if (result == U_SUCCESS)
+                        nameTail.clear();
+                    break;
+                // PSP directory regular file
+                default:
+                    pspFilesList.push_back({ fileOffset, e.Size, model->base(entryIndex), fileName, e.Flags.raw,
+                        e.Type, (UINT8)e.SubProgram, (UINT8)e.Instance, (UINT8)e.RomId, (UINT8)e.Writable, 0, 0, 0, 0, 0, 0, 0 });
+                    result = U_SUCCESS;
+                    break;
+            }
+            if (result != U_SUCCESS) {
+                if (!probe)
+                    msg(usprintf("%s: failed to parse PSP directory file: ", __FUNCTION__) + fileName, entryIndex);
+            }
+        }
+        if (!nameTail.isEmpty())
+            if (!probe)
+                model->setName(entryIndex, model->name(entryIndex) + nameTail);
+    }
+
+    return U_SUCCESS;
+}
+
+// Decodes any supported PSP table found at the specified offset
+USTATUS FfsParser::pspParseDirectory(const UByteArray & amdImage, const UINT32 offset, const Subtypes::DirectorySubtypes expected,
+    const UModelIndex & parent, UModelIndex & index, const bool probe)
+{
+    Subtypes::DirectorySubtypes type;
+    Subtypes::RegionSubtypes subtype;
+    UString typeName;
+
+    if (offset % 16) {
+        if (!probe)
+            msg(usprintf("%s: invalid offset specified: %Xh", __FUNCTION__, offset), parent);
+        return U_INVALID_PARAMETER;
+    }
+
+    if ((offset + sizeof(UINT32)) > amdImage.size()) {
+        if (!probe)
+            msg(usprintf("%s: directory table at offset %Xh is outside of the image", __FUNCTION__, offset), parent);
+        return U_BUFFER_TOO_SMALL;
+    }
+
+    const UINT32* cookie = (const UINT32*)(amdImage.constData() + offset);
+    switch (*cookie) {
+        case AMD_PSP_DIRECTORY_HEADER_SIGNATURE:
+            type = Subtypes::PSPDirectory;
+            subtype = Subtypes::PspL1DirectoryRegion;
+            typeName = "PSP";
+            break;
+        case AMD_PSPL2_DIRECTORY_HEADER_SIGNATURE:
+            type = Subtypes::PSPDirectory;
+            subtype = Subtypes::PspL2DirectoryRegion;
+            typeName = "PSP L2";
+            break;
+        case AMD_BIOS_HEADER_SIGNATURE:
+            type = Subtypes::BIOSDirectory;
+            subtype = Subtypes::PspL1DirectoryRegion;
+            typeName = "BIOS";
+            break;
+        case AMD_BHDL2_HEADER_SIGNATURE:
+            type = Subtypes::BIOSDirectory;
+            subtype = Subtypes::PspL2DirectoryRegion;
+            typeName = "BIOS L2";
+            break;
+        case AMD_PSP_COMBO_DIRECTORY_HEADER_SIGNATURE:
+            type = Subtypes::ComboDirectory;
+            subtype = Subtypes::PspL1DirectoryRegion;
+            typeName = "PSP Combo";
+            break;
+        case AMD_PSP_BHD2_DIRECTORY_HEADER_SIGNATURE:
+            type = Subtypes::ComboDirectory;
+            subtype = Subtypes::PspL1DirectoryRegion;
+            typeName = "BIOS Combo";
+            break;
+        case 0:
+        case 0xFFFFFFFF:
+            if (!probe)
+                msg(usprintf("%s: there is no directory table at offset %Xh", __FUNCTION__, offset), parent);
+            return U_UNKNOWN_ITEM_TYPE;
+        default:
+            if (!probe)
+                msg(usprintf("%s: directory table header at offset %Xh has unsupported cookie %08Xh", __FUNCTION__, offset, *cookie), parent);
+            return U_UNKNOWN_ITEM_TYPE;
+    }
+
+    switch (expected) {
+        case Subtypes::PSPDirectory:
+        case Subtypes::BIOSDirectory:
+        case Subtypes::ComboDirectory:
+            if (expected != type) {
+                if (!probe)
+                    msg(usprintf("%s: ", __FUNCTION__) + typeName + usprintf(" directory table header is unexpected here"), parent);
+                return U_INVALID_IMAGE;
+            }
+            break;
+        default: // some other type - process any directory
+            break;
+    }
+
+    USTATUS result;
+    UINT32 spiEraseBlockSize = 0;
+    UINT32 headerSize, tableSize, regionSize, numEntries;
+    bool additionalInfoValid = true;
+    switch (type) {
+        case Subtypes::PSPDirectory:
+        case Subtypes::BIOSDirectory:
+        {
+            const AMD_PSPBIOS_COMMON_HEADER* hdr = (const AMD_PSPBIOS_COMMON_HEADER*)(amdImage.constData() + offset);
+            spiEraseBlockSize = 4096 << (hdr->Version ? hdr->v1.SpiBlockSize : hdr->SpiBlockSize);
+            additionalInfoValid = spiEraseBlockSize < amdImage.size() / 2;
+            headerSize = (hdr->Version && additionalInfoValid)
+                ? (16 << hdr->v1.DirHeaderSize) : sizeof(AMD_PSPBIOS_COMMON_HEADER);
+            numEntries = hdr->NumEntries;
+            tableSize = headerSize + numEntries * (type == Subtypes::PSPDirectory
+                ? sizeof(AMD_PSP_DIRECTORY_ENTRY) : sizeof(AMD_BIOS_DIRECTORY_ENTRY));
+            regionSize = additionalInfoValid ? ((hdr->Version ? hdr->v1.DirSize : hdr->DirSize) << 12) : tableSize;
+            break;
+        }
+        default:
+            const AMD_PSP_COMBO_DIRECTORY_HEADER* hdr = (const AMD_PSP_COMBO_DIRECTORY_HEADER*)(amdImage.constData() + offset);
+            headerSize = sizeof(AMD_PSP_COMBO_DIRECTORY_HEADER);
+            numEntries = hdr->NumEntries;
+            tableSize = headerSize + numEntries * sizeof(AMD_PSP_COMBO_ENTRY);
+            regionSize = tableSize; // Combo table does not have a region
+            break;
+    }
+
+    // Full header is part of image?
+    if ((offset + headerSize) > amdImage.size()) {
+        if (!probe)
+            msg(usprintf("%s: ", __FUNCTION__) + typeName + usprintf(" directory table header at offset %Xh is not within the image", offset), parent);
+        return U_BUFFER_TOO_SMALL;
+    }
+
+    // Full table is part of image?
+    if ((offset + tableSize) > amdImage.size()) {
+        if (!probe)
+            msg(usprintf("%s: ", __FUNCTION__) + typeName + usprintf(" directory table at offset %Xh is not within the image", offset), parent);
+        return U_BUFFER_TOO_SMALL;
+    }
+
+    // Validate table checksum ASAP
+    const UINT32 checksum = ((AMD_COMMON_HEADER*)(amdImage.constData() + offset))->Checksum;
+    const UINT32 checksumOffset = offsetof(AMD_COMMON_HEADER, Checksum) + sizeof(AMD_COMMON_HEADER::Checksum); // Start after checksum field
+    const UINT32 calcChecksum = fletcher32(amdImage.mid(offset + checksumOffset, tableSize - checksumOffset));
+    UINT64 crc = ((UINT64)calcChecksum << 32) + checksum;
+    if (calcChecksum != checksum) {
+        if (!probe)
+            msg(usprintf("%s: ", __FUNCTION__) + typeName + usprintf(" directory table at offset %Xh checksum is invalid", offset), parent);
+        // don't fail here because somebody may want to fix the checksum
+    }
+
+    // Validate table region size
+    if (regionSize < tableSize)
+        regionSize = tableSize;
+    if (offset + regionSize > amdImage.size()) {
+        if (!probe)
+            msg(usprintf("%s: ", __FUNCTION__) + typeName + usprintf(" directory region at offset %Xh is not fully within the image", offset), parent);
+        regionSize = (UINT32)amdImage.size() - offset;
+        // shall we exit with an error here?
+    }
+
+    UModelIndex tableIndex, regionIndex = parent;
+
+    if (!probe) {
+        // Add directory region if exists
+        bool regionAdded = false;
+        if (regionSize > tableSize) {
+            const UString dirName = typeName + UString(" directory region");
+            result = insertByRange(offset, Types::Region, subtype,
+                dirName, UString(), UString(),
+                0, regionSize, 0,
+                parent, index);
+            if (result != U_SUCCESS && result != U_DIR_ALREADY_EXIST)
+                return result;
+            regionIndex = index;
+            regionAdded = true;
+        }
+
+        // Add directory table
+        const UString dirName = typeName + UString(" directory table");
+        if (model->type(parent) == Types::DirectoryTableEntry)
+            model->setName(parent, model->name(parent) + dirName);
+        UString details = usprintf("Entry count: %u\nChecksum: %08Xh, ", numEntries, (UINT32)crc)
+            + ((UINT32)crc == (crc >> 32) ? "valid\n" : usprintf("invalid, should be %08Xh\n", (UINT32)(crc >> 32)));
+        switch (type) {
+            case Subtypes::PSPDirectory:
+            case Subtypes::BIOSDirectory:
+            {
+                const AMD_PSPBIOS_COMMON_HEADER* hdr = (const AMD_PSPBIOS_COMMON_HEADER*)(amdImage.constData() + offset);
+                details += usprintf("Additional info: %08Xh", hdr->AdditionalInfo.raw)
+                    + (!additionalInfoValid ? UString(", invalid or not present\n")
+                        : usprintf("\n  Info version: %01u\n  SPI erase block size: %Xh (%u)\n  Address mode: %01Xh\n",
+                            hdr->Version, spiEraseBlockSize, spiEraseBlockSize, hdr->Version ? hdr->v1.AddrMode : hdr->AddrMode));
+                break;
+            }
+            default:
+                break;
+        }
+        result = insertByRange(offset, Types::DirectoryTable, type,
+            dirName, UString(), details,
+            headerSize, tableSize - headerSize, 0,
+            regionIndex, tableIndex);
+        if (result != U_SUCCESS && result != U_DIR_ALREADY_EXIST)
+            return result;
+        if (result == U_DIR_ALREADY_EXIST)
+            return U_SUCCESS;
+        if (!regionAdded)
+            index = tableIndex;
+    }
+
+    UModelIndex dummyIndex;
+    switch (type) {
+        case Subtypes::PSPDirectory:
+            result = pspParsePSPEntries(amdImage, offset, headerSize, numEntries, tableIndex, dummyIndex, probe);
+            break;
+        case Subtypes::BIOSDirectory:
+            result = pspParseBIOSEntries(amdImage, offset, headerSize, numEntries, tableIndex, dummyIndex, probe);
+            break;
+        case Subtypes::ComboDirectory:
+            result = pspParseComboEntries(amdImage, offset, headerSize, numEntries, tableIndex, dummyIndex, probe);
+            break;
+        default:
+            if (!probe)
+                msg(usprintf("%s: unknown directory table", __FUNCTION__), parent);
+            return U_UNKNOWN_ITEM_TYPE;
+    }
+
+    return result;
+}
+
+static UINT64 bitMaskFromValue(UINT64 x)
+{
+    x |= x >> 1; x |= x >> 2; x |= x >> 4; x |= x >> 8; x |= x >> 16; x |= x >> 32;
+    return x;
+}
+
+USTATUS FfsParser::pspParseEFStructure(const UByteArray & amdImage, const UINT32 offset, const UModelIndex & parent, UModelIndex& index, const bool probe)
+{
+    if (offset + offsetof(AMD_EMBEDDED_FIRMWARE, PSP_Directory) > amdImage.size())
+        return U_INVALID_FLASH_DESCRIPTOR;
+
+    AMD_EMBEDDED_FIRMWARE* fet = (AMD_EMBEDDED_FIRMWARE*)(amdImage.constData() + offset);
+    if (fet->Signature != AMD_EMBEDDED_FIRMWARE_SIGNATURE)
+        return U_INVALID_FLASH_DESCRIPTOR;
+
+    pspFilesList.clear();
+    UINT32 fetEndMarker = 1;
+
+    // Try to detect FET real size
+    auto fetCut = [&fetEndMarker](const char* ptr, const UINT32 size)->UINT32 {
+        UINT32 newSize = size;
+        UINT32 blankVal = 1;
+        while (newSize > offsetof(AMD_EMBEDDED_FIRMWARE, NewPSP_Directory)) {
+            UINT32 val = *(UINT32*)(ptr + newSize - sizeof(UINT32));
+            if (val == 0 || val == 0xFFFFFFFF) {
+                if (blankVal != UINT32_MAX && blankVal != 0) {
+                    blankVal = val;
+                    fetEndMarker = val;
+                }
+                if (val != blankVal)
+                    break;
+                newSize -= sizeof(UINT32);
+            }
+            else
+                break;
+        }
+        return newSize;
+    };
+    const char* const fetPtr = amdImage.constData() + offset;
+    const UINT32 fetHdrSize = sizeof(AMD_EMBEDDED_FIRMWARE::Signature);
+    UINT32 fetRawSize = offset + sizeof(AMD_EMBEDDED_FIRMWARE) > amdImage.size() ? (UINT32)amdImage.size() - offset : sizeof(AMD_EMBEDDED_FIRMWARE);
+    fetRawSize &= ~(UINT32)(sizeof(UINT32) - 1);
+    fetRawSize = fetCut(fetPtr, fetRawSize);
+    UINT32 fetNewSize = fetRawSize;
+    UINT32 fetTailSize = 0;
+    while (fetNewSize >= offsetof(AMD_EMBEDDED_FIRMWARE, PSP_Directory)) {
+        UINT32 val = *(UINT32*)(fetPtr + fetNewSize - sizeof(UINT32));
+        if (val == 0xFFFF5500 || val == 0x000E55AA) {
+            fetEndMarker = val;
+            fetTailSize = sizeof(UINT32);
+            break;
+        }
+        fetNewSize -= sizeof(UINT32);
+    }
+    if (fetNewSize >= offsetof(AMD_EMBEDDED_FIRMWARE, PSP_Directory))
+        fetRawSize = fetNewSize;
+    if (fetRawSize - fetTailSize <= offsetof(AMD_EMBEDDED_FIRMWARE, PSP_Directory)) {
+        msg(usprintf("%s: FET candidate found at offset %Xh, too small to contain at least one directory table pointer", __FUNCTION__, offset), parent);
+        return U_INVALID_FLASH_DESCRIPTOR;
+    }
+    UINT32 endOffset = offset + fetRawSize - fetTailSize;
+
+    // Get some info about root firmwares
+    USTATUS result;
+    struct ptrList { const char* name; const UINT32 ptrOffs; };
+    if (!probe) {
+        UModelIndex containerIndex = imageIndex(parent);
+        result = insertByRange(model->base(parent) - model->base(containerIndex), Types::Image, Subtypes::AmdImage,
+            UString("Embedded firmware structure"), UString(), UString(),
+            0, (UINT32)amdImage.size(), 0,
+            parent, index);
+        if (result == U_DIR_ALREADY_EXIST) {
+            msg(usprintf("%s: ", __FUNCTION__) + model->name(index) + usprintf(" at offset %Xh was already parsed",
+                model->base(parent) - model->base(containerIndex)), index);
+            return U_SUCCESS;
+        }
+        if (result != U_SUCCESS)
+            return result;
+
+        const struct ptrList firmwares[] = {
+            { "IMC", offsetof(AMD_EMBEDDED_FIRMWARE, IMC_Firmware) }, { "GEC", offsetof(AMD_EMBEDDED_FIRMWARE, GEC_Firmware) },
+            { "xHCI", offsetof(AMD_EMBEDDED_FIRMWARE, xHCI_Firmware) } };
+        for (const auto& fw : firmwares) {
+            const UINT32 fwPtrOffs = fw.ptrOffs + offset;
+            const UINT32 fwOffs = pspDirectoryOffset(amdImage, *(UINT32*)(amdImage.constData() + fwPtrOffs));
+            if (fwOffs == 0 || fwOffs == UINT32_MAX)
+                msg(usprintf("%s: %s firmware is not provided", __FUNCTION__, fw.name), index);
+            else {
+                msg(usprintf("%s: %s firmware at offset %Xh", __FUNCTION__, fw.name, fwOffs), index);
+            }
+        }
+    }
+
+    // The specification between SoCs changed a lot, and at this point the
+    // SoC/PSP ID isn't known. Attempt to decode all tables without assuming
+    // to find a specific type
+    UString fetStrippedBy;
+    int foundDirs = 0;
+    USTATUS overall = U_INVALID_STORE;
+    UModelIndex childIndex;
+
+    // At least, one PSP directory is mandatory (but on very ancient platforms
+    // FET can be without any PSP or BIOS dirs, only firmwares)
+    const struct ptrList pspDirs[] = {
+        { "PSP", offsetof(AMD_EMBEDDED_FIRMWARE, PSP_Directory) }, { "NewPSP", offsetof(AMD_EMBEDDED_FIRMWARE, NewPSP_Directory) },
+        { "BackupPSP",  offsetof(AMD_EMBEDDED_FIRMWARE, BackupPSP_Directory) } };
+    for (const auto& dir : pspDirs) {
+        const UINT32 dirPtrOffs = dir.ptrOffs + offset;
+        if (dirPtrOffs < endOffset) {
+            result = U_INVALID_PARAMETER;
+            const UINT32 dirPtr = *(UINT32*)(amdImage.constData() + dirPtrOffs);
+            const UINT32 dirOffs = pspDirectoryOffset(amdImage, dirPtr);
+            if (dirOffs < UINT32_MAX)
+                result = pspParseDirectory(amdImage, dirOffs, Subtypes::AnyDirectory, index, childIndex, probe);
+            if (result == U_SUCCESS) {
+                if (dirOffs > offset && dirOffs < endOffset) {
+                    fetStrippedBy = usprintf("%s directory table at offset %Xh", dir.name, dirOffs);
+                    endOffset = dirOffs;
+                }
+                if (!probe) {
+                    msg(usprintf("%s: %s directory table at offset %Xh", __FUNCTION__, dir.name, dirOffs), childIndex);
+                    model->setText(childIndex, usprintf("FET %s", dir.name));
+                }
+                foundDirs++;
             }
             else {
-                // Nothing is parsed yet, but the store is not empty 
-                if (!offset) {
-                    msg(QObject::tr("parseVssStoreBody: store can't be parsed as VSS store"), index);
-                    return ERR_SUCCESS;
+                if (!probe)
+                    msg(usprintf("%s: %s directory table is invalid or not provided (%Xh)", __FUNCTION__, dir.name, dirPtr), index);
+                overall = result;
+            }
+        }
+    }
+    if (foundDirs == 0)
+        return overall;
+
+    // BIOS directories is not mandatory for some ancient platforms, only count found dirs for now
+    foundDirs = 0;
+    const struct ptrList biosDirs[] = {
+        { "BIOS0", offsetof(AMD_EMBEDDED_FIRMWARE, BIOS0_Entry) }, { "BIOS1", offsetof(AMD_EMBEDDED_FIRMWARE, BIOS1_Entry) },
+        { "BIOS2", offsetof(AMD_EMBEDDED_FIRMWARE, BIOS2_Entry) }, { "BIOS3", offsetof(AMD_EMBEDDED_FIRMWARE, BIOS3_Entry) } };
+    for (const auto& dir : biosDirs) {
+        const UINT32 dirPtrOffs = dir.ptrOffs + offset;
+        if (dirPtrOffs < endOffset) {
+            result = U_INVALID_PARAMETER;
+            const UINT32 dirPtr = *(UINT32*)(amdImage.constData() + dirPtrOffs);
+            const UINT32 dirOffs = pspDirectoryOffset(amdImage, dirPtr);
+            if (dirOffs < UINT32_MAX)
+                result = pspParseDirectory(amdImage, dirOffs, Subtypes::AnyDirectory, index, childIndex, probe);
+            if (result == U_SUCCESS) {
+                if (dirOffs > offset && dirOffs < endOffset) {
+                    fetStrippedBy = usprintf("%s directory table at offset %Xh", dir.name, dirOffs);
+                    endOffset = dirOffs;
                 }
-
-                // It's a padding
-                name = QObject::tr("Padding");
-                type = Types::Padding;
-                subtype = getPaddingType(padding);
+                if (!probe) {
+                    msg(usprintf("%s: %s directory table at offset %Xh", __FUNCTION__, dir.name, dirOffs), childIndex);
+                    model->setText(childIndex, usprintf("FET %s", dir.name));
+                }
+                foundDirs++;
             }
-
-            // Get info
-            QString info = QObject::tr("Full size: %1h (%2)")
-                .hexarg(padding.size()).arg(padding.size());
-            
-            // Construct parsing data
-            pdata.offset = parentOffset + offset;
-            
-            // Add tree item
-            model->addItem(type, subtype, name, QString(), info, QByteArray(), padding, QByteArray(), false, parsingDataToQByteArray(pdata), index);
-
-            return ERR_SUCCESS;
+            else {
+                if (!probe)
+                    msg(usprintf("%s: %s directory table is invalid or not provided (%Xh)", __FUNCTION__, dir.name, dirPtr), index);
+                overall = result;
+            }
         }
-
-        QString info;
-        
-        // Rename invalid variables
-        if (isInvalid) {
-            name = QObject::tr("Invalid");
-        }
-        else { // Add GUID and text for valid variables
-            name = guidToQString(*variableGuid);
-            info += QObject::tr("Variable GUID: %1\n").arg(name);
-            text = QString::fromUtf16(variableName);
-        }
-
-        // Add header, body and extended data info
-        info += QObject::tr("Full size: %1h (%2)\nHeader size %3h (%4)\nBody size: %5h (%6)")
-            .hexarg(variableSize).arg(variableSize)
-            .hexarg(header.size()).arg(header.size())
-            .hexarg(body.size()).arg(body.size());
-
-        // Add state info
-        info += QObject::tr("\nState: %1h").hexarg2(variableHeader->State, 2);
-
-        // Add attributes info
-        info += QObject::tr("\nAttributes: %1h (%2)").hexarg2(variableHeader->Attributes, 8).arg(vssAttributesToQString(variableHeader->Attributes));
-
-        // Set subtype and add related info
-        if (isInvalid)
-            subtype = Subtypes::InvalidVssEntry;
-        else if (isAuthenticated) {
-            subtype = Subtypes::AuthVssEntry;
-            info += QObject::tr("\nMonotonic counter: %1h\nTimestamp: %2\nPubKey index: %3")
-                .hexarg(monotonicCounter).arg(efiTimeToQString(timestamp)).arg(pubKeyIndex);
-
-        }
-        else if (isAppleCrc32) {
-            subtype = Subtypes::AppleVssEntry;
-            info += QObject::tr("\nData checksum: %1h%2").hexarg2(storedCrc32, 8)
-                .arg(storedCrc32 == calculatedCrc32 ? QObject::tr(", valid") : QObject::tr(", invalid, should be %1h").hexarg2(calculatedCrc32,8));
-        }
-        else
-            subtype = Subtypes::StandardVssEntry;
-
-        // Add correct offset to parsing data
-        pdata.offset = parentOffset + offset;
-
-        // Add tree item
-        model->addItem(Types::VssEntry, subtype, name, text, info, header, body, QByteArray(), false, parsingDataToQByteArray(pdata), index);
-
-        // Move to next variable
-        offset += variableSize;
     }
 
-    return ERR_SUCCESS;
-}
-
-STATUS FfsParser::parseFsysStoreBody(const QModelIndex & index)
-{
-    // Sanity check
-    if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
-    // Get parsing data for the current item
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-    UINT32 parentOffset = pdata.offset + model->header(index).size();
-    const QByteArray data = model->body(index);
-
-    // Check that the is enough space for variable header
-    const UINT32 dataSize = (UINT32)data.size();
-    UINT32 offset = 0;
-
-    // Parse all variables
-    while (1) {
-        UINT32 unparsedSize = dataSize - offset;
-        UINT32 variableSize = 0;
-
-        // Get nameSize and name of the variable
-        const UINT8 nameSize = *(UINT8*)(data.constData() + offset);
-        // Check sanity
-        if (unparsedSize >= nameSize + sizeof(UINT8)) {
-            variableSize = nameSize + sizeof(UINT8);
+    if (!probe) {
+        // Sort files by offset, size, parent's base, etc.
+        qsort(pspFilesList.data(), pspFilesList.size(), sizeof(PSP_FILE_SPEC),
+            [](const void* pa, const void* pb)->int {
+                const PSP_FILE_SPEC* a = static_cast<const PSP_FILE_SPEC*>(pa);
+                const PSP_FILE_SPEC* b = static_cast<const PSP_FILE_SPEC*>(pb);
+                if (a->offset != b->offset)
+                    return (a->offset > b->offset) - (b->offset > a->offset);
+                if (a->size != b->size)
+                    return (b->size > a->size) - (a->size > b->size);
+                if (a->dir != b->dir)
+                    return (b->dir > a->dir) - (a->dir > b->dir);
+                if (a->parent != b->parent)
+                    return (a->parent > b->parent) - (b->parent > a->parent);
+                return (a->flags > b->flags) - (b->flags > a->flags);
+            });
+        // Group identical binaries with same offset and size, drop with same parents
+        UINT32 prevParentBase, prevOffset, prevSize;
+        prevParentBase = prevOffset = prevSize = UINT32_MAX;
+        std::vector<std::vector<PSP_FILE_SPEC*>*> quantiList;
+        for (auto& f : pspFilesList) {
+            if (prevParentBase == f.parent)
+                continue;
+            prevParentBase = f.parent;
+            if (prevOffset != f.offset || prevSize != f.size)
+                quantiList.push_back(new std::vector<PSP_FILE_SPEC*>);
+            prevOffset = f.offset;
+            prevSize = f.size;
+            quantiList[quantiList.size() - 1]->push_back(&f);
         }
-
-        QByteArray name;
-        if (variableSize) {
-            name = data.mid(offset + sizeof(UINT8), nameSize);
-            // Check for EOF variable
-            if (nameSize == 3 && name[0] == 'E' && name[1] == 'O' && name[2] == 'F') {
-                // There is no data afterward, add EOF variable and free space and return
-                QByteArray header = data.mid(offset, sizeof(UINT8) + nameSize);
-                QString info = QObject::tr("Full size: %1h (%2)")
-                    .hexarg(header.size()).arg(header.size());
-                
-                // Add correct offset to parsing data
-                pdata.offset = parentOffset + offset;
-                
-                // Add EOF tree item
-                model->addItem(Types::FsysEntry, 0, name, QString(), info, header, QByteArray(), QByteArray(), false, parsingDataToQByteArray(pdata), index);
-
-                // Add free space
-                offset += header.size();
-                unparsedSize = dataSize - offset;
-                QByteArray body = data.mid(offset);
-                info = QObject::tr("Full size: %1h (%2)")
-                    .hexarg(body.size()).arg(body.size());
-
-                // Add correct offset to parsing data
-                pdata.offset = parentOffset + offset;
-
-                // Add free space tree item
-                model->addItem(Types::FreeSpace, 0, QObject::tr("Free space"), QString(), info, QByteArray(), body, QByteArray(), false, parsingDataToQByteArray(pdata), index);
-
-                return ERR_SUCCESS;
-            }
-        }
-
-        // Get dataSize and data of the variable
-        const UINT16 dataSize = *(UINT16*)(data.constData() + offset + sizeof(UINT8) + nameSize);
-        if (unparsedSize >= sizeof(UINT8) + nameSize + sizeof(UINT16) + dataSize) {
-            variableSize = sizeof(UINT8) + nameSize + sizeof(UINT16) + dataSize;
-        }
-        else {
-            // Last variable is bad, add the rest as padding and return
-            QByteArray body = data.mid(offset);
-            QString info = QObject::tr("Full size: %1h (%2)")
-                .hexarg(body.size()).arg(body.size());
-
-            // Add correct offset to parsing data
-            pdata.offset = parentOffset + offset;
-
-            // Add free space tree item
-            model->addItem(Types::Padding, getPaddingType(body), QObject::tr("Padding"), QString(), info, QByteArray(), body, QByteArray(), false, parsingDataToQByteArray(pdata), index);
-            
-            // Show message
-            msg(QObject::tr("parseFsysStoreBody: next variable appears too big, added as padding"), index);
-
-            return ERR_SUCCESS;
-        }
-
-        // Construct header and body
-        QByteArray header = data.mid(offset, sizeof(UINT8) + nameSize + sizeof(UINT16));
-        QByteArray body = data.mid(offset + sizeof(UINT8) + nameSize + sizeof(UINT16), dataSize);
-
-        // Add info
-        QString info = QObject::tr("Full size: %1h (%2)\nHeader size %3h (%4)\nBody size: %5h (%6)")
-            .hexarg(variableSize).arg(variableSize)
-            .hexarg(header.size()).arg(header.size())
-            .hexarg(body.size()).arg(body.size());
-
-        // Add correct offset to parsing data
-        pdata.offset = parentOffset + offset;
-
-        // Add tree item
-        model->addItem(Types::FsysEntry, 0, name, QString(), info, header, body, QByteArray(), false, parsingDataToQByteArray(pdata), index);
-
-        // Move to next variable
-        offset += variableSize;
-    }
-    
-    return ERR_SUCCESS;
-}
-
-STATUS FfsParser::parseEvsaStoreBody(const QModelIndex & index)
-{
-    // Sanity check
-    if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
-    // Get parsing data for the current item
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-    UINT32 parentOffset = pdata.offset + model->header(index).size();
-    const QByteArray data = model->body(index);
-
-    // Check that the is enough space for entry header
-    const UINT32 dataSize = (UINT32)data.size();
-    UINT32 offset = 0;
-
-    std::map<UINT16, EFI_GUID> guidMap;
-    std::map<UINT16, QString> nameMap;
-
-    // Parse all entries
-    UINT32 unparsedSize = dataSize;
-    while (unparsedSize) {
-        UINT32 variableSize = 0;
-        QString name;
-        QString info;
-        QByteArray header;
-        QByteArray body;
-        UINT8 subtype;
-        UINT8 calculated;
-
-        const EVSA_ENTRY_HEADER* entryHeader = (const EVSA_ENTRY_HEADER*)(data.constData() + offset);
-
-        // Check entry size
-        variableSize = sizeof(EVSA_ENTRY_HEADER);
-        if (unparsedSize < variableSize || unparsedSize < entryHeader->Size) {
-            QByteArray body = data.mid(offset);
-            QString info = QObject::tr("Full size: %1h (%2)")
-                .hexarg(body.size()).arg(body.size());
-
-            // Checke type
-            QString name = QObject::tr("Free space");
-            UINT8 type = Types::FreeSpace;
-            UINT8 subtype = 0;
-            if (getPaddingType(body) == Subtypes::DataPadding) {
-                name = QObject::tr("Padding");
-                type = Types::Padding;
-                subtype = Subtypes::DataPadding;
-            }
-
-            // Add correct offset to parsing data
-            pdata.offset = parentOffset + offset;
-
-            // Add free space tree item
-            QModelIndex itemIndex = model->addItem(type, subtype, name, QString(), info, QByteArray(), body, QByteArray(), false, parsingDataToQByteArray(pdata), index);
-            
-            // Show message
-            if (type == Types::Padding)
-                msg(QObject::tr("parseEvsaStoreBody: variable parsing failed, rest of unparsed store added as padding"), itemIndex);
-            
-            break;
-        }
-        variableSize = entryHeader->Size;
-
-        // Recalculate entry checksum
-        calculated = calculateChecksum8(((const UINT8*)entryHeader) + 2, entryHeader->Size - 2);
-
-        // GUID entry
-        if (entryHeader->Type == NVRAM_EVSA_ENTRY_TYPE_GUID1 || 
-            entryHeader->Type == NVRAM_EVSA_ENTRY_TYPE_GUID2) {
-            const EVSA_GUID_ENTRY* guidHeader = (const EVSA_GUID_ENTRY*)entryHeader;
-            header = data.mid(offset, sizeof(EVSA_GUID_ENTRY));
-            body = data.mid(offset + sizeof(EVSA_GUID_ENTRY), guidHeader->Header.Size - sizeof(EVSA_GUID_ENTRY));
-            EFI_GUID guid = *(EFI_GUID*)body.constData();
-            name = guidToQString(guid);
-            info = QObject::tr("GUID: %1\nFull size: %2h (%3)\nHeader size %4h (%5)\nBody size: %6h (%7)\nType: %8h\nChecksum: %9\nGuidId: %10h")
-                .arg(name)
-                .hexarg(variableSize).arg(variableSize)
-                .hexarg(header.size()).arg(header.size())
-                .hexarg(body.size()).arg(body.size())
-                .hexarg2(guidHeader->Header.Type, 2)
-                .arg(guidHeader->Header.Checksum == calculated ?
-                    QObject::tr("%1h, valid").hexarg2(calculated, 2) :
-                    QObject::tr("%1h, invalid, should be %2h").hexarg2(guidHeader->Header.Checksum, 2).hexarg2(calculated, 2))
-                .hexarg2(guidHeader->GuidId, 4);
-            subtype = Subtypes::GuidEvsaEntry;
-            guidMap.insert(std::pair<UINT16, EFI_GUID>(guidHeader->GuidId, guid));
-        }
-        // Name entry
-        else if (entryHeader->Type == NVRAM_EVSA_ENTRY_TYPE_NAME1 ||
-            entryHeader->Type == NVRAM_EVSA_ENTRY_TYPE_NAME2) {
-            const EVSA_NAME_ENTRY* nameHeader = (const EVSA_NAME_ENTRY*)entryHeader;
-            header = data.mid(offset, sizeof(EVSA_NAME_ENTRY));
-            body = data.mid(offset + sizeof(EVSA_NAME_ENTRY), nameHeader->Header.Size - sizeof(EVSA_NAME_ENTRY));
-            name = QString::fromUtf16((const CHAR16*)body.constData());
-            info = QObject::tr("Name: %1\nFull size: %2h (%3)\nHeader size %4h (%5)\nBody size: %6h (%7)\nType: %8h\nChecksum: %9\nVarId: %10h")
-                .arg(name)
-                .hexarg(variableSize).arg(variableSize)
-                .hexarg(header.size()).arg(header.size())
-                .hexarg(body.size()).arg(body.size())
-                .hexarg2(nameHeader->Header.Type, 2)
-                .arg(nameHeader->Header.Checksum == calculated ?
-                    QObject::tr("%1h, valid").hexarg2(calculated, 2) :
-                    QObject::tr("%1h, invalid, should be %2h").hexarg2(nameHeader->Header.Checksum, 2).hexarg2(calculated, 2))
-                .hexarg2(nameHeader->VarId, 4);
-            subtype = Subtypes::NameEvsaEntry;
-            nameMap.insert(std::pair<UINT16, QString>(nameHeader->VarId, name));
-        }
-        // Data entry
-        else if (entryHeader->Type == NVRAM_EVSA_ENTRY_TYPE_DATA1 ||
-            entryHeader->Type == NVRAM_EVSA_ENTRY_TYPE_DATA2 ||
-            entryHeader->Type == NVRAM_EVSA_ENTRY_TYPE_DATA_INVALID) {
-            const EVSA_DATA_ENTRY* dataHeader = (const EVSA_DATA_ENTRY*)entryHeader;
-            // Check for extended header
-            UINT32 headerSize = sizeof(EVSA_DATA_ENTRY);
-            UINT32 dataSize = dataHeader->Header.Size - sizeof(EVSA_DATA_ENTRY);
-            if (dataHeader->Attributes & NVRAM_EVSA_DATA_EXTENDED_HEADER) {
-                const EVSA_DATA_ENTRY_EXTENDED* dataHeaderExtended = (const EVSA_DATA_ENTRY_EXTENDED*)entryHeader;
-                headerSize = sizeof(EVSA_DATA_ENTRY_EXTENDED);
-                dataSize = dataHeaderExtended->DataSize;
-                variableSize = headerSize + dataSize;
-            }
-
-            header = data.mid(offset, headerSize);
-            body = data.mid(offset + headerSize, dataSize);
-            name = QObject::tr("Data");
-            info = QObject::tr("Full size: %1h (%2)\nHeader size %3h (%4)\nBody size: %5h (%6)\nType: %7h\nChecksum: %8\nVarId: %9h\nGuidId: %10h\nAttributes: %11h (%12)")
-                .hexarg(variableSize).arg(variableSize)
-                .hexarg(headerSize).arg(headerSize)
-                .hexarg(dataSize).arg(dataSize)
-                .hexarg2(dataHeader->Header.Type, 2)
-                .arg(dataHeader->Header.Checksum == calculated ?
-                    QObject::tr("%1h, valid").hexarg2(calculated, 2) :
-                    QObject::tr("%1h, invalid, should be %2h").hexarg2(dataHeader->Header.Checksum, 2).hexarg2(calculated, 2))
-                .hexarg2(dataHeader->VarId, 4)
-                .hexarg2(dataHeader->GuidId, 4)
-                .hexarg2(dataHeader->Attributes, 8).arg(evsaAttributesToQString(dataHeader->Attributes));
-            subtype = Subtypes::DataEvsaEntry;
-        }
-        // Unknown entry or free space
-        else {
-            QByteArray body = data.mid(offset);
-            QString info = QObject::tr("Full size: %1h (%2)")
-                .hexarg(body.size()).arg(body.size());
-
-            // Check type
-            QString name = QObject::tr("Free space");
-            UINT8 type = Types::FreeSpace;
-            UINT8 subtype = 0;
-            if (getPaddingType(body) == Subtypes::DataPadding) {
-                name = QObject::tr("Padding");
-                type = Types::Padding;
-                subtype = Subtypes::DataPadding;
-            }
-
-            // Add correct offset to parsing data
-            pdata.offset = parentOffset + offset;
-
-            // Add free space tree item
-            QModelIndex itemIndex = model->addItem(type, subtype, name, QString(), info, QByteArray(), body, QByteArray(), false, parsingDataToQByteArray(pdata), index);
-
-            // Show message
-            if (type == Types::Padding)
-                msg(QObject::tr("parseEvsaStoreBody: unknown variable of type %1h found at offset %2h, the rest of unparsed store added as padding").hexarg2(entryHeader->Type, 2).hexarg(offset), itemIndex);
-            break;
-        }
-
-        // Add correct offset to parsing data
-        pdata.offset = parentOffset + offset;
-
-        // Add tree item
-        model->addItem(Types::EvsaEntry, subtype, name, QString(), info, header, body, QByteArray(), false, parsingDataToQByteArray(pdata), index);
-
-        // Move to next variable
-        offset += variableSize;
-        unparsedSize = dataSize - offset;
-    }
-
-    // Reparse all data variables to detect invalid ones and assign name and test to valid ones
-    for (int i = 0; i < model->rowCount(index); i++) {
-        QModelIndex current = index.child(i, 0);
-        if (model->subtype(current) == Subtypes::DataEvsaEntry) {
-            QByteArray header = model->header(current);
-            const EVSA_DATA_ENTRY* dataHeader = (const EVSA_DATA_ENTRY*)header.constData();
-            QString guid;
-            if (guidMap.count(dataHeader->GuidId)) 
-                guid = guidToQString(guidMap[dataHeader->GuidId]);
-            QString name;
-            if (nameMap.count(dataHeader->VarId))
-                name = nameMap[dataHeader->VarId];
-            
-            // Check for variable validity
-            if (guid.isEmpty() && name.isEmpty()) { // Both name and guid aren't found
-                model->setSubtype(current, Subtypes::InvalidEvsaEntry);
-                model->setName(current, QObject::tr("Invalid"));
-                msg(QObject::tr("parseEvsaStoreBody: data variable with invalid GuidId and invalid VarId"), current);
-            }
-            else if (guid.isEmpty()) { // Guid not found
-                model->setSubtype(current, Subtypes::InvalidEvsaEntry);
-                model->setName(current, QObject::tr("Invalid"));
-                msg(QObject::tr("parseEvsaStoreBody: data variable with invalid GuidId"), current);
-            }
-            else if (name.isEmpty()) { // Name not found
-                model->setSubtype(current, Subtypes::InvalidEvsaEntry);
-                model->setName(current, QObject::tr("Invalid"));
-                msg(QObject::tr("parseEvsaStoreBody: data variable with invalid VarId"), current);
-            }
-            else { // Variable is OK, rename it
-                if (dataHeader->Header.Type == NVRAM_EVSA_ENTRY_TYPE_DATA_INVALID) {
-                    model->setSubtype(current, Subtypes::InvalidEvsaEntry);
-                    model->setName(current, QObject::tr("Invalid"));
+        // This complicated logic is only to get informed
+        // about dublicated binaries properties are identical or not
+        for (const auto* qf : quantiList) {
+            int nameDiff, typeDiff, subDiff, instDiff, romDiff, dirDiff, wrDiff, flagsDiff,
+                rstDiff, cpyDiff, roDiff, compDiff, regDiff, destDiff;
+            bool first = true;
+            PSP_FILE_SPEC ref;
+            for (const auto* f : *qf) {
+                if (first) {
+                    ref = *f;
+                    nameDiff = typeDiff = subDiff = instDiff = romDiff = dirDiff = wrDiff = flagsDiff
+                        = rstDiff = cpyDiff = roDiff = compDiff = regDiff = destDiff = 0;
+                    first = false;
                 }
                 else {
-                    model->setName(current, guid);
+                    nameDiff += ref.name == f->name ? 0 : 1;
+                    typeDiff += ref.type == f->type ? 0 : 1;
+                    subDiff += ref.sub == f->sub ? 0 : 1;
+                    instDiff += ref.inst == f->inst ? 0 : 1;
+                    romDiff += ref.rom == f->rom ? 0 : 1;
+                    dirDiff += ref.dir == f->dir ? 0 : 1;
+                    wrDiff += ref.wr == f->wr ? 0 : 1;
+                    flagsDiff += ref.flags == f->flags ? 0 : 1;
+                    if (f->dir) {
+                        rstDiff += ref.rst == f->rst ? 0 : 1;
+                        cpyDiff += ref.cpy == f->cpy ? 0 : 1;
+                        roDiff += ref.ro == f->ro ? 0 : 1;
+                        compDiff += ref.comp == f->comp ? 0 : 1;
+                        regDiff += ref.reg == f->reg ? 0 : 1;
+                        destDiff += ref.dest == f->dest ? 0 : 1;
+                    }
                 }
-                model->setText(current, name);
-                model->addInfo(current, QObject::tr("GUID: %1\nName: %2\n").arg(guid).arg(name), false);
+            }
+            UString nameStr = nameDiff ? "Different types from multiple parents" : ref.name;
+            if ((subDiff || ref.sub || instDiff || ref.inst) && !(subDiff && instDiff)) {
+                nameStr += " (" + UString(subDiff ? "*" : usprintf("%X", ref.sub)) + ":"
+                    + UString(instDiff ? "*" : usprintf("%01X", ref.inst)) + ")";
+            }
+            if (ref.size == 0 || ref.size == UINT32_MAX) {
+                msg(usprintf("%s: skipping %s directory regular file with no size: ",
+                        __FUNCTION__, dirDiff ? "PSP/BIOS" : (ref.dir ? "BIOS" : "PSP"))
+                    + nameStr, model->findByBase(ref.parent, index));
+                continue;
+            }
+            UString typeStr = "Type: " + UString(typeDiff ? "*" : usprintf("%02Xh", ref.type));
+            typeStr += dirDiff ? " (different directories types)" : usprintf(" (%s directory file)",
+                ref.dir ? "BIOS" : "PSP");
+            const UString subStr   = "SubProgram: " + UString(subDiff ? "*" : usprintf("%02Xh", ref.sub));
+            const UString instStr  = "Instance: " + UString(instDiff ? "*" : usprintf("%01Xh", ref.inst));
+            const UString romStr   = "RomId: " + UString(romDiff ? "*" : usprintf("%01Xh", ref.rom));
+            const UString wrStr    = "Writable: " + UString(wrDiff ? "*" : ref.wr ? "true" : "false");
+            const UString flagsStr = "Flags: " + UString(flagsDiff ? "*" : usprintf("%04Xh", ref.flags));
+            UString infoStr = typeStr + "\n" + subStr + "\n" + instStr + "\n" + romStr + "\n" + wrStr + "\n";
+            if (!dirDiff && ref.dir) {
+                const UString rstStr  = "Reset-image: " + UString(rstDiff ? "*" : ref.rst ? "true" : "false");
+                const UString cpyStr  = "Copy image: " + UString(cpyDiff ? "*" : ref.cpy ? "true" : "false");
+                const UString roStr   = "Read only: " + UString(roDiff ? "*" : ref.ro ? "true" : "false");
+                const UString compStr = "Compressed: " + UString(compDiff ? "*" : ref.comp ? "true" : "false");
+                const UString regStr  = "Region type: " + UString(regDiff ? "*" : usprintf("%02Xh", ref.reg));
+                const UString destStr = "Destination: " + UString(destDiff ? "*" : usprintf("%" PRIX64 "Xh", ref.dest));
+                infoStr += rstStr + "\n" + cpyStr + "\n" + roStr + "\n" + compStr + "\n" + flagsStr + "\n" + regStr + "\n" + destStr + "\n";
+            }
+            else
+                infoStr += flagsStr + "\n";
+            UString textStr = "Type " + UString(typeDiff ? "*" : usprintf("%02Xh", ref.type));
+            if (subDiff || ref.sub)
+                textStr += ", SubProgram " + UString(subDiff ? "*" : usprintf("%Xh", ref.sub));
+            if (instDiff || ref.inst)
+                textStr += ", Instance " + UString(instDiff ? "*" : usprintf("%01Xh", ref.inst));
+            first = true;
+            for (const auto* f : *qf) {
+                UByteArray bin, binUncompressed;
+                bool compressed = false;
+                // Preprocess special file types
+                if (first) {
+                    first = false;
+                    switch (f->type) {
+                        case AMD_BIOS_BIN:
+                            bin = amdImage.mid(f->offset, f->size);
+                            if (f->comp) {
+                                result = decompressBios(bin, binUncompressed);
+                                if (result == U_SUCCESS) {
+                                    compressed = true;
+                                    infoStr += usprintf(
+                                        "Compression algorithm: Zlib\nDecompressed size: %Xh (%u)\n", (UINT32)bin.size(), (UINT32)bin.size());
+                                }
+                                else {
+                                    infoStr += "Compression algorithm: unknown\n";
+                                    msg(usprintf("%s: decompression failed with error: ", __FUNCTION__) + errorCodeToUString(result), childIndex);
+                                }
+                            }
+                            break;
+                    }
+                }
+                // Add file to tree
+                result = insertByRange(f->offset, Types::Region, Subtypes::PspDirectoryFile,
+                    nameStr, textStr, infoStr,
+                    0, f->size, 0,
+                    model->findByBase(f->parent, index), childIndex);
+                if (result != U_SUCCESS && result != U_DIR_ALREADY_EXIST) {
+                    msg(usprintf("%s: failed to create %s directory file: ",
+                            __FUNCTION__, dirDiff ? "PSP/BIOS" : (ref.dir ? "BIOS" : "PSP"))
+                        + nameStr, childIndex);
+                    continue;
+                }
+                if (result == U_DIR_ALREADY_EXIST)
+                    continue;
+                // Postprocess special file types
+                UModelIndex dumbIndex;
+                switch (f->type) {
+                    case AMD_EFS_BACKUP: {
+                        auto pspMaxOffsetSave = pspMaxOffset;
+                        auto pspFilesListSave = pspFilesList;
+                        pspParseEFStructure(amdImage.mid(f->offset, f->size), 0, childIndex, dumbIndex);
+                        pspMaxOffset = pspMaxOffsetSave;
+                        pspFilesList = pspFilesListSave;
+                    } break;
+                    case AMD_BIOS_BIN:
+                        if (compressed) {
+                            model->setUncompressedData(childIndex, binUncompressed);
+                            model->setCompressed(childIndex, true);
+                            bin = binUncompressed;
+                        }
+                        parseGenericImage(bin, 0, childIndex, dumbIndex);
+                        break;
+                    }
             }
         }
+        UINT32 fetUpdSize = endOffset - offset + fetTailSize;
+        if (fetUpdSize < fetRawSize) {
+            fetRawSize = fetUpdSize;
+            fetTailSize = 0;
+        }
+        fetUpdSize = fetCut(fetPtr, fetRawSize);
+        if (fetUpdSize < fetRawSize) {
+            fetRawSize = fetUpdSize;
+            fetTailSize = 0;
+        }
+        UString fetInfo = usprintf("Maximum PSP offset: %" PRIX64 "h\n", pspMaxOffset - 1);
+        if (fetRawSize < sizeof(AMD_EMBEDDED_FIRMWARE)) {
+            if (fetEndMarker == 1)
+                fetInfo += "Stripped by " + fetStrippedBy;
+            else {
+                fetInfo += "End marker: ";
+                if (fetEndMarker == 0 || fetEndMarker == 0xFFFFFFFF)
+                    fetInfo += usprintf("%02Xh\n", (UINT8)fetEndMarker);
+                else
+                    fetInfo += usprintf("%08Xh\n", fetEndMarker);
+            }
+            fetInfo += "\n";
+        }
+        insertByRange(offset, Types::DirectoryTable, Subtypes::PSPDirectory,
+            "Firmware entry table", UString(), fetInfo,
+            fetHdrSize, fetRawSize - fetHdrSize - fetTailSize, fetTailSize,
+            index, childIndex);
+        if (fetRawSize - fetTailSize >= offsetof(AMD_EMBEDDED_FIRMWARE, BIOS3_Entry))
+            msg(usprintf("%s: EFS generation is %Xh", __FUNCTION__, fet->EFS_Generation), childIndex);
+        else
+            msg(usprintf("%s: ancient FET without EFS generation", __FUNCTION__), childIndex);
     }
 
-    return ERR_SUCCESS;
+    return U_SUCCESS;
 }
 
 
-STATUS FfsParser::parseFlashMapBody(const QModelIndex & index)
+USTATUS FfsParser::parseAMDImage(const UByteArray& amdImage, const UINT32 localOffset, const UModelIndex& parent, UModelIndex& index)
 {
-    // Sanity check
-    if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
+    USTATUS result = U_INVALID_IMAGE;
+    UINT32 probeOffset;
+    UModelIndex efsIndex;
+    struct efsDesc { UINT32 probe; UINT32 bank; UINT32 size; };
+    std::vector<struct efsDesc> efsDescsList;
 
-    // Get parsing data for the current item
-    PARSING_DATA pdata = parsingDataFromQModelIndex(index);
-    UINT32 parentOffset = pdata.offset + model->header(index).size();
-    const QByteArray data = model->body(index);
-
-    
-    const UINT32 dataSize = (UINT32)data.size();
-    UINT32 offset = 0;
-    UINT32 unparsedSize = dataSize;
-    // Parse all entries
-    while (unparsedSize) {
-        const PHOENIX_FLASH_MAP_ENTRY* entryHeader = (const PHOENIX_FLASH_MAP_ENTRY*)(data.constData() + offset);
-
-        // Check entry size
-        if (unparsedSize < sizeof(PHOENIX_FLASH_MAP_ENTRY)) {
-            // Last variable is bad, add the rest as padding and return
-            QByteArray body = data.mid(offset);
-            QString info = QObject::tr("Full size: %1h (%2)")
-                .hexarg(body.size()).arg(body.size());
-
-            // Add correct offset to parsing data
-            pdata.offset = parentOffset + offset;
-
-            // Add free space tree item
-            model->addItem(Types::Padding, getPaddingType(body), QObject::tr("Padding"), QString(), info, QByteArray(), body, QByteArray(), false, parsingDataToQByteArray(pdata), index);
-
-            // Show message
-            if (unparsedSize < entryHeader->Size)
-                msg(QObject::tr("parseFlashMapBody: next entry appears too big, added as padding"), index);
-
-            break;
+    // Probe all possible locations for the header
+    const UINT32 bankSizeMin = 0x200000;
+    UINT32 bankStep = bankSizeMin;
+    UINT32 bankSize = bankStep, bankOffset = 0;
+    for (probeOffset = AMD_EMBEDDED_FIRMWARE_OFFSET; (probeOffset + sizeof(AMD_EMBEDDED_FIRMWARE)) < amdImage.size(); probeOffset += 0x20000) {
+        UINT32 bankOffsetTemp = bankOffset;
+        while (bankOffsetTemp < probeOffset) {
+            while (bankSize <= amdImage.size() - bankOffsetTemp) {
+                const UByteArray bankImage = amdImage.mid(bankOffsetTemp, amdImage.size() - bankOffsetTemp);
+                pspSpiRomBase = UINT32_MAX - bankSize + 1;
+                pspMaxOffset = 0;
+                result = pspParseEFStructure(bankImage, probeOffset - bankOffsetTemp, UModelIndex(), efsIndex, true);
+                if (result == U_INVALID_FLASH_DESCRIPTOR)
+                    break;
+                if (result == U_SUCCESS) {
+                    // if pspMaxOffset is too high then it's probably near 0xFFxxxxxx meaning that pspSpiRomBase is not valid
+                    if (pspMaxOffset < INT32_MAX) {
+                        if (pspMaxOffset > amdImage.size() - bankOffsetTemp)
+                            pspMaxOffset = amdImage.size() - bankOffsetTemp;
+                        UINT32 bankSizeTemp = (UINT32)(bitMaskFromValue(pspMaxOffset - 1) + 1);
+                        // some files, such as BIOS binary, can be compressed, but it's size declared
+                        // is for uncompressed data; so, because BIOS binary usually (if not always)
+                        // is at the end of the bank, it's resulted end may be slightly ouside the bank
+                        if (pspMaxOffset < bankSizeTemp / 2 + bankSizeTemp / 8)
+                            bankSizeTemp /= 2;
+                        if (bankSize < bankSizeTemp)
+                            bankSize = bankSizeTemp;
+                        efsDescsList.push_back({ probeOffset, bankOffsetTemp, bankSize });
+                        break;
+                    }
+                }
+                bankSize *= 2;
+            }
+            if (result == U_SUCCESS) {
+                bankStep = bankSize;
+                break;
+            }
+            bankOffsetTemp += bankStep;
+            if (result == U_INVALID_FLASH_DESCRIPTOR) {
+                bankOffset = bankOffsetTemp;
+                break;
+            }
         }
-
-        QString name = guidToQString(entryHeader->Guid);
-        
-        // Construct header
-        QByteArray header = data.mid(offset, sizeof(PHOENIX_FLASH_MAP_ENTRY));
-
-        // Add info
-        QString info = QObject::tr("Entry GUID: %1\nFull size: 24h (36)\nHeader size: 24h (36)\nBody size: 0h (0)\nEntry type: %2h\nData type: %3h\nMemory address: %4h\nSize: %5h\nOffset: %6h")
-            .arg(name)
-            .hexarg2(entryHeader->EntryType, 4)
-            .hexarg2(entryHeader->DataType, 4)
-            .hexarg2(entryHeader->PhysicalAddress, 8)
-            .hexarg2(entryHeader->Size, 8)
-            .hexarg2(entryHeader->Offset, 8);
-
-        // Add correct offset to parsing data
-        pdata.offset = parentOffset + offset;
-
-        // Determine subtype
-        UINT8 subtype = 0;
-        switch (entryHeader->DataType) {
-        case NVRAM_PHOENIX_FLASH_MAP_ENTRY_TYPE_VOLUME:
-            subtype = Subtypes::VolumeFlashMapEntry;
-            break;
-        case NVRAM_PHOENIX_FLASH_MAP_ENTRY_TYPE_DATA_BLOCK:
-            subtype = Subtypes::DataFlashMapEntry;
-            break;
-        }
-
-        // Add tree item
-        model->addItem(Types::FlashMapEntry, subtype, name, flashMapGuidToQString(entryHeader->Guid), info, header, QByteArray(), QByteArray(), true, parsingDataToQByteArray(pdata), index);
-
-        // Move to next variable
-        offset += sizeof(PHOENIX_FLASH_MAP_ENTRY);
-        unparsedSize = dataSize - offset;
+    }
+    if (efsDescsList.empty()) {
+        // This is not an error to be reported here, as this is the way to stop parsing non-AMD images
+        return U_ITEM_NOT_FOUND;
     }
 
-    return ERR_SUCCESS;
+    // Add dummy bank if 1st detected bank is not at the beginning of the image
+    if (efsDescsList.at(0).bank > 0)
+        efsDescsList.insert(efsDescsList.begin(), { UINT32_MAX, 0, efsDescsList.at(0).bank });
+    UINT32 bankOffsetLast = (UINT32)(efsDescsList.back().bank);
+    UINT32 bankSizeLast = efsDescsList.back().size;
+    // ...and add dummy bank if last detected bank is not at the end of the image
+    if (bankOffsetLast + bankSizeLast < amdImage.size())
+        efsDescsList.push_back({ UINT32_MAX, bankOffsetLast + bankSizeLast, (UINT32)amdImage.size() - bankOffsetLast - bankSizeLast });
+
+    // Finally, try to detect/correct bank size
+    bankSize = 1;
+    for (int i = 0; i < efsDescsList.size(); i++) {
+        UINT32 currentSize = efsDescsList.at(i).size;
+        if (bankSize < currentSize)
+            bankSize = currentSize;
+    }
+    bool singleImage = amdImage.size() <= bankSize;
+
+    // Add AMD image tree item
+    index = model->addItem(
+        localOffset, Types::Image, Subtypes::AmdImage,
+        "AMD image", UString(), UString(),
+        UByteArray(), amdImage, UByteArray(),
+        Fixed, parent);
+    UModelIndex amdIndex = index;
+
+    UINT32 efsInstance = 0;
+    for (int i = 0; i < efsDescsList.size(); i++) {
+        bankOffset = efsDescsList.at(i).bank;
+        probeOffset = (UINT32)(efsDescsList.at(i).probe) - bankOffset;
+        UString bankName = usprintf("Bank %u", bankOffset / bankSize);
+
+        UModelIndex bankIndex = amdIndex;
+        UByteArray bankImage = amdImage.mid(bankOffset, bankSize);
+        if (efsDescsList.size() > 1) {
+            bankIndex = model->addItem(
+                bankOffset, Types::Image, Subtypes::AmdImage,
+                bankName, UString(), UString(),
+                UByteArray(), bankImage, UByteArray(),
+                Fixed, bankIndex);
+            efsInstance = 0;
+        }
+        bool noEFS = true;
+        if (efsDescsList.at(i).probe != UINT32_MAX) {
+            noEFS = false;
+            pspSpiRomBase = UINT32_MAX - (UINT32)bitMaskFromValue(bankImage.size() - 1);
+            result = pspParseEFStructure(bankImage, probeOffset, bankIndex, efsIndex);
+            UString efsTitleSuffix = efsInstance > 0 ? usprintf(" #%u", efsInstance + 1) : UString();
+            if (model->rowCount(efsIndex) > 0) {
+                if (result != U_SUCCESS) {
+                    msg(usprintf("%s: ", __FUNCTION__) + model->name(efsIndex) + UString(" was not fully parsed")
+                        + (singleImage ? "" : usprintf(" (bank %u)", bankOffset / bankSize)), bankIndex);
+                }
+                else
+                    model->setName(efsIndex, model->name(efsIndex) + efsTitleSuffix);
+            }
+        }
+        UModelIndex uefiIndex;
+        result = parseGenericImage(bankImage, 0, bankIndex, uefiIndex);
+        if (noEFS && (U_STORES_NOT_FOUND == result || model->rowCount(uefiIndex) <= 0)) {
+            model->setName(uefiIndex, "Padding");
+            model->setType(uefiIndex, Types::Padding);
+            model->setSubtype(uefiIndex, getPaddingType(bankImage));
+            result = U_SUCCESS;
+        }
+        typename std::decay<decltype(indexesAddressDiffs)>::type::value_type p;
+        p.first = uefiIndex;
+        p.second = 0x100000000ULL - model->base(p.first) - model->fullSize(p.first);
+        addressDiff = p.second;
+        indexesAddressDiffs.push_back(p);
+    }
+
+    pspFilesList.clear();
+
+    return result;
 }

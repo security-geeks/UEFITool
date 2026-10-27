@@ -14,39 +14,39 @@ WITHOUT WARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
 #ifndef TREEITEM_H
 #define TREEITEM_H
 
-#include <QByteArray>
-#include <QList>
-#include <QString>
-#include <QVariant>
+#include <list>
+#include <iterator>
 
 #include "basetypes.h"
+#include "ubytearray.h"
+#include "ustring.h"
 
 class TreeItem
 {
 public:
-    TreeItem(const UINT8 type, const UINT8 subtype, const QString &name, const QString &text, const QString &info,
-        const QByteArray & header, const QByteArray & body, const QByteArray & tail,
-        const BOOLEAN fixed, const BOOLEAN compressed, const QByteArray & parsingData,
+    TreeItem(const UINT32 offset, const UINT8 type, const UINT8 subtype, const UString &name, const UString &text, const UString &info,
+        const UByteArray & header, const UByteArray & body, const UByteArray & tail,
+        const bool fixed, const bool compressed,
         TreeItem *parent = 0);
-    ~TreeItem() { qDeleteAll(childItems); }
+    ~TreeItem();                                                               // Non-trivial implementation in CPP file
 
     // Operations with items
-    void appendChild(TreeItem *item) { childItems.append(item); }
-    void prependChild(TreeItem *item) { childItems.prepend(item); };
+    void appendChild(TreeItem *item) { childItems.push_back(item); }
+    void prependChild(TreeItem *item) { childItems.push_front(item); };
     UINT8 insertChildBefore(TreeItem *item, TreeItem *newItem);                // Non-trivial implementation in CPP file
     UINT8 insertChildAfter(TreeItem *item, TreeItem *newItem);                 // Non-trivial implementation in CPP file
 
     // Model support operations
-    TreeItem *child(int row) { return childItems.value(row, NULL); }
-    int childCount() const {return childItems.count(); }
+    TreeItem *child(int row);                                                  // Non-trivial implementation in CPP file
+    int childCount() const {return (int)childItems.size(); }
     int columnCount() const { return 5; }
-    QVariant data(int column) const;                                           // Non-trivial implementation in CPP file
+    UString data(int column) const;                                            // Non-trivial implementation in CPP file
     int row() const;                                                           // Non-trivial implementation in CPP file
     TreeItem *parent() { return parentItem; }
 
-    // Reading operations for item parameters
-    QString name() const  { return itemName; }
-    void setName(const QString &text) { itemName = text; }
+    // Getters and setters for item parameters
+    UINT32 offset() const { return itemOffset; }
+    void setOffset(const UINT32 offset) { itemOffset = offset; }
 
     UINT8 type() const  { return itemType; }
     void setType(const UINT8 type) { itemType = type; }
@@ -54,49 +54,73 @@ public:
     UINT8 subtype() const { return itemSubtype; }
     void setSubtype(const UINT8 subtype) { itemSubtype = subtype; }
 
-    QString text() const { return itemText; }
-    void setText(const QString &text) { itemText = text; }
+    UString name() const  { return itemName; }
+    void setName(const UString &text) { itemName = text; }
 
-    QByteArray header() const { return itemHeader; }
+    UString text() const { return itemText; }
+    void setText(const UString &text) { itemText = text; }
+
+    const UByteArray & header() const { return itemHeader; }
     bool hasEmptyHeader() const { return itemHeader.isEmpty(); }
+    UINT32 headerSize() const { return (UINT32)itemHeader.size(); }
 
-    QByteArray body() const { return itemBody; };
+    const UByteArray & body() const { return itemBody; };
     bool hasEmptyBody() const { return itemBody.isEmpty(); }
+    UINT32 bodySize() const { return (UINT32)itemBody.size(); }
 
-    QByteArray tail() const { return itemTail; };
+    const UByteArray & tail() const { return itemTail; };
     bool hasEmptyTail() const { return itemTail.isEmpty(); }
+    UINT32 tailSize() const {return (UINT32)itemTail.size();}
+    
+    UByteArray full() const { return itemHeader + itemBody + itemTail; }
+    UINT32 fullSize() const { return (UINT32)(itemHeader.size() + itemBody.size() + itemTail.size()); }
 
-    QByteArray parsingData() const { return itemParsingData; }
-    bool hasEmptyParsingData() const { return itemParsingData.isEmpty(); }
-    void setParsingData(const QByteArray & data) { itemParsingData = data; }
-
-    QString info() const { return itemInfo; }
-    void addInfo(const QString &info, const BOOLEAN append) { if (append) itemInfo.append(info); else itemInfo.prepend(info); }
-    void setInfo(const QString &info) { itemInfo = info; }
+    UString info() const { return itemInfo; }
+    void addInfo(const UString &info, const bool append) { if (append) itemInfo += info; else itemInfo = info + itemInfo; }
+    void setInfo(const UString &info) { itemInfo = info; }
     
     UINT8 action() const {return itemAction; }
     void setAction(const UINT8 action) { itemAction = action; }
 
-    BOOLEAN fixed() const { return itemFixed; }
+    bool fixed() const { return itemFixed; }
     void setFixed(const bool fixed) { itemFixed = fixed; }
 
-    BOOLEAN compressed() const { return itemCompressed; }
+    bool compressed() const { return itemCompressed; }
     void setCompressed(const bool compressed) { itemCompressed = compressed; }
 
+    UByteArray parsingData() const { return itemParsingData; };
+    bool hasEmptyParsingData() const { return itemParsingData.isEmpty(); }
+    void setParsingData(const UByteArray & pdata) { itemParsingData = pdata; }
+
+    UByteArray uncompressedData() const { return itemUncompressedData; };
+    bool hasEmptyUncompressedData() const { return itemUncompressedData.isEmpty(); }
+    void setUncompressedData(const UByteArray & ucdata) { itemUncompressedData = ucdata; }
+    
+    UByteArray alignmentBytes() const { return itemAlignmentBytes; };
+    bool hasEmptyAlignmentBytes() const { return itemAlignmentBytes.isEmpty(); }
+    void setAlignmentBytes(const UByteArray & abytes) { itemAlignmentBytes = abytes; }
+    
+    UINT8 marking() const { return itemMarking; }
+    void setMarking(const UINT8 marking) { itemMarking = marking; }
+
 private:
-    QList<TreeItem*> childItems;
+    std::list<TreeItem*> childItems;
+    UINT32     itemOffset;
     UINT8      itemAction;
     UINT8      itemType;
     UINT8      itemSubtype;
-    QString    itemName;
-    QString    itemText;
-    QString    itemInfo;
-    QByteArray itemHeader;
-    QByteArray itemBody;
-    QByteArray itemTail;
-    QByteArray itemParsingData;
+    UINT8      itemMarking;
+    UString    itemName;
+    UString    itemText;
+    UString    itemInfo;
+    UByteArray itemHeader;
+    UByteArray itemBody;
+    UByteArray itemTail;
     bool       itemFixed;
     bool       itemCompressed;
+    UByteArray itemParsingData;
+    UByteArray itemUncompressedData;
+    UByteArray itemAlignmentBytes;
     TreeItem*  parentItem;
 };
 

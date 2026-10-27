@@ -12,23 +12,23 @@ WITHWARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
 */
 
 #include "LzmaDecompress.h"
-#include "SDK/C/Types.h"
+#include "SDK/C/7zTypes.h"
 #include "SDK/C/7zVersion.h"
 
 #include <stdlib.h>
 
 UINT64
 EFIAPI
-LShiftU64(
-UINT64                    Operand,
-UINT32                     Count
-)
+LShiftU64 (
+    UINT64 Operand,
+    UINT32 Count
+    )
 {
     return Operand << Count;
 }
 
-static void * AllocForLzma(void *p, size_t size) { (void)p; return malloc(size); }
-static void FreeForLzma(void *p, void *address) { (void)p; free(address); }
+static void * AllocForLzma(ISzAllocPtr p, size_t size) { (void)p; return malloc(size); }
+static void FreeForLzma(ISzAllocPtr p, void *address) { (void)p; free(address); }
 static ISzAlloc SzAllocForLzma = { &AllocForLzma, &FreeForLzma };
 
 /*
@@ -39,12 +39,12 @@ Get the size of the uncompressed buffer by parsing EncodeData header.
 @return The size of the uncompressed buffer.
 */
 UINT64
-GetDecodedSizeOfBuf(
-UINT8 *EncodedData
-)
+GetDecodedSizeOfBuf (
+    UINT8 *EncodedData
+    )
 {
     UINT64 DecodedSize;
-    INT32   Index;
+    INT32  Index;
 
     // Parse header
     DecodedSize = 0;
@@ -72,7 +72,7 @@ checking of the validity of the source data. It just retrieves the "Original Siz
 field from the LZMA_HEADER_SIZE beginning bytes of the source data and output it as DestinationSize.
 And ScratchSize is specific to the decompression implementation.
 
-If SourceSize is less than LZMA_HEADER_SIZE, then ASSERT().
+If SourceSize is less than LZMA_HEADER_SIZE, then return U_BUFFER_TOO_SMALL.
 
 @param  Source          The source buffer containing the compressed data.
 @param  SourceSize      The size, bytes, of the source buffer.
@@ -85,22 +85,28 @@ DestinationSize and the size of the scratch
 buffer was returned ScratchSize.
 
 */
-INT32
+USTATUS
 EFIAPI
-LzmaGetInfo(
-CONST VOID  *Source,
-UINT32      SourceSize,
-UINT32      *DestinationSize
-)
+LzmaGetInfo (
+    CONST VOID  *Source,
+    UINT32       SourceSize,
+    UINT32       *DestinationSize
+    )
 {
-    UInt64  DecodedSize;
+    UINT64 DecodedSize;
+    if (SourceSize <= LZMA_HEADER_SIZE) {
+        return U_BUFFER_TOO_SMALL;
+    }
 
-    ASSERT(SourceSize >= LZMA_HEADER_SIZE); (void)SourceSize;
-    
     DecodedSize = GetDecodedSizeOfBuf((UINT8*)Source);
 
-    *DestinationSize = (UINT32)DecodedSize;
-    return ERR_SUCCESS;
+    if (DecodedSize <= UINT32_MAX) {
+        *DestinationSize = (UINT32)DecodedSize;
+        return U_SUCCESS;
+    }
+    else {
+        return U_INVALID_PARAMETER;
+    }
 }
 
 /*
@@ -122,13 +128,13 @@ the uncompressed buffer is returned Destination.
 The source buffer specified by Source is corrupted
 (not a valid compressed format).
 */
-INT32
+USTATUS
 EFIAPI
-LzmaDecompress(
-CONST VOID  *Source,
-UINT32       SourceSize,
-VOID    *Destination
-)
+LzmaDecompress (
+    CONST VOID  *Source,
+    UINT32      SourceSize,
+    VOID        *Destination
+    )
 {
     SRes              LzmaResult;
     ELzmaStatus       Status;
@@ -151,9 +157,9 @@ VOID    *Destination
         );
 
     if (LzmaResult == SZ_OK) {
-        return ERR_SUCCESS;
+        return U_SUCCESS;
     }
     else {
-        return ERR_INVALID_PARAMETER;
+        return U_INVALID_PARAMETER;
     }
 }

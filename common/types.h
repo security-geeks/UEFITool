@@ -27,7 +27,7 @@ namespace Actions
         Replace,
         Remove,
         Rebuild,
-        Rebase
+        Rebase,
     };
 }
 
@@ -44,59 +44,95 @@ namespace Types {
         Section,
         FreeSpace,
         VssStore,
+        Vss2Store,
         FtwStore,
         FdcStore,
-        FsysStore,
+        SysFStore,
         EvsaStore,
-        FlashMapStore,
+        PhoenixFlashMapStore,
+        InsydeFlashDeviceMapStore,
+        DellDvarStore,
         CmdbStore,
+        NvarGuidStore,
         NvarEntry,
         VssEntry,
-        FsysEntry,
+        SysFEntry,
         EvsaEntry,
-        FlashMapEntry,
-        Microcode,
+        PhoenixFlashMapEntry,
+        InsydeFlashDeviceMapEntry,
+        DellDvarEntry,
+        IntelMicrocode,
         SlicData,
+        IfwiHeader,
+        IfwiPartition,
+        FptStore,
+        FptEntry,
+        FptPartition,
+        BpdtStore,
+        BpdtEntry,
+        BpdtPartition,
+        CpdStore,
+        CpdEntry,
+        CpdPartition,
+        CpdExtension,
+        CpdSpiEntry,
+        StartupApDataEntry,
+        DirectoryTable,
+        DirectoryTableEntry,
+        AmdMicrocode,
     };
 }
 
 namespace Subtypes {
     enum ImageSubtypes{
         IntelImage = 90,
-        UefiImage
+        UefiImage,
+        AmdImage,
     };
 
     enum CapsuleSubtypes {
         AptioSignedCapsule = 100,
         AptioUnsignedCapsule,
         UefiCapsule,
-        ToshibaCapsule
+        ToshibaCapsule,
     };
 
     enum VolumeSubtypes {
         UnknownVolume = 110,
         Ffs2Volume,
         Ffs3Volume,
-        NvramVolume
+        NvramVolume,
+        AppleMicrocodeVolume,
     };
 
     enum RegionSubtypes {
+        // Intel
         DescriptorRegion = 0,
         BiosRegion,
         MeRegion,
         GbeRegion,
         PdrRegion,
+        DevExp1Region,
+        Bios2Region,
+        MicrocodeRegion,
+        EcRegion,
+        DevExp2Region,
+        IeRegion,
+        Tgbe1Region,
+        Tgbe2Region,
         Reserved1Region,
         Reserved2Region,
-        Reserved3Region,
-        EcRegion,
-        Reserved4Region
+        PttRegion,
+        // AMD
+        PspL1DirectoryRegion,
+        PspL2DirectoryRegion,
+        PspDirectoryFile,
     };
 
     enum PaddingSubtypes {
         ZeroPadding = 120,
         OnePadding,
-        DataPadding
+        DataPadding,
     };
 
     enum NvarEntrySubtypes {
@@ -104,18 +140,32 @@ namespace Subtypes {
         InvalidLinkNvarEntry,
         LinkNvarEntry,
         DataNvarEntry,
-        FullNvarEntry
+        FullNvarEntry,
     };
 
     enum VssEntrySubtypes {
         InvalidVssEntry = 140,
         StandardVssEntry,
         AppleVssEntry,
-        AuthVssEntry
+        AuthVssEntry,
+        IntelVssEntry,
     };
 
+    enum SysFEntrySubtypes {
+        InvalidSysFEntry = 150,
+        NormalSysFEntry,
+    };
+    
+    enum DirectorySubtypes {
+        PSPDirectory = 155,
+        ComboDirectory,
+        BIOSDirectory,
+        ISHDirectory,
+        AnyDirectory,
+    };
+    
     enum EvsaEntrySubtypes {
-        InvalidEvsaEntry = 150,
+        InvalidEvsaEntry = 160,
         UnknownEvsaEntry,
         GuidEvsaEntry,
         NameEvsaEntry,
@@ -123,26 +173,65 @@ namespace Subtypes {
     };
 
     enum FlashMapEntrySubtypes {
-        VolumeFlashMapEntry = 160,
-        DataFlashMapEntry
+        VolumeFlashMapEntry = 170,
+        DataFlashMapEntry,
+        UnknownFlashMapEntry,
+    };
+
+    enum DvarEntrySubtypes {
+        InvalidDvarEntry = 180,
+        NamespaceGuidDvarEntry,
+        NameIdDvarEntry,
+        UnknownDvarEntry
     };
 
     enum MicrocodeSubtypes {
-        IntelMicrocode = 170,
-        AmdMicrocode
+        IntelMicrocode = 190,
+        AmdMicrocode,
     };
 
     enum SlicDataSubtypes {
-        PubkeySlicData = 180,
-        MarkerSlicData
+        PubkeySlicData = 200,
+        MarkerSlicData,
     };
-};
 
-// *ToQString conversion routines
-extern QString actionTypeToQString(const UINT8 action);
-extern QString itemTypeToQString(const UINT8 type);
-extern QString itemSubtypeToQString(const UINT8 type, const UINT8 subtype);
-extern QString compressionTypeToQString(const UINT8 algorithm);
-extern QString regionTypeToQString(const UINT8 type);
+    // Intel ME-specific
+    enum IfwiPartitionSubtypes {
+        DataIfwiPartition = 210,
+        BootIfwiPartition,
+    };
+
+    enum FptEntrySubtypes {
+        ValidFptEntry = 220,
+        InvalidFptEntry,
+    };
+
+    enum FptPartitionSubtypes {
+        CodeFptPartition = 230,
+        DataFptPartition,
+        GlutFptPartition,
+    };
+
+    enum CpdPartitionSubtypes {
+        ManifestCpdPartition = 240,
+        MetadataCpdPartition,
+        KeyCpdPartition,
+        CodeCpdPartition,
+    };
+
+    enum StartupApDataEntrySubtypes {
+        x86128kStartupApDataEntry = 250,
+    };
+}
+
+// *ToUString conversion routines
+extern UString actionTypeToUString(const UINT8 action);
+extern UString itemTypeToUString(const UINT8 type);
+extern UString itemSubtypeToUString(const UINT8 type, const UINT8 subtype);
+extern UString compressionTypeToUString(const UINT8 algorithm);
+extern UString regionTypeToUString(const UINT8 type);
+extern UString fitEntryTypeToUString(const UINT8 type);
+extern UString hashTypeToUString(const UINT16 digest_agorithm_id);
+extern UString insydeFlashDeviceMapEntryTypeGuidToUString(const EFI_GUID & guid);
 
 #endif // TYPES_H

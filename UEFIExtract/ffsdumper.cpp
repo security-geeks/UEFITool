@@ -13,87 +13,219 @@ WITHOUT WARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
 
 #include "ffsdumper.h"
 
-FfsDumper::FfsDumper(TreeModel* treeModel)
-    : model(treeModel), dumped(false)
-{
-}
+#include <fstream>
 
-FfsDumper::~FfsDumper()
-{
-}
-
-STATUS FfsDumper::dump(const QModelIndex & root, const QString & path, const QString & guid)
+USTATUS FfsDumper::dump(const UModelIndex & root, const UString & path, const DumpMode dumpMode, const UINT8 sectionType, const UString & guid)
 {
     dumped = false;
-    UINT8 result = recursiveDump(root, path, guid);
-    if (result)
-        return result;
-    else if (!dumped)
-        return ERR_ITEM_NOT_FOUND;
-    return ERR_SUCCESS;
-}
+    counterHeader = counterBody = counterRaw = counterInfo = 0;
+    fileList.clear();
 
-STATUS FfsDumper::recursiveDump(const QModelIndex & index, const QString & path, const QString & guid)
-{
-    if (!index.isValid())
-        return ERR_INVALID_PARAMETER;
-
-    QDir dir;
-    if (guid.isEmpty() ||
-        guidToQString(*(const EFI_GUID*)model->header(index).constData()) == guid ||
-        guidToQString(*(const EFI_GUID*)model->header(model->findParentOfType(index, Types::File)).constData()) == guid) {
-
-        if (dir.cd(path))
-            return ERR_DIR_ALREADY_EXIST;
-
-        if (!dir.mkpath(path))
-            return ERR_DIR_CREATE;
-
-        QFile file;
-        if (!model->header(index).isEmpty()) {
-            file.setFileName(QObject::tr("%1/header.bin").arg(path));
-            if (!file.open(QFile::WriteOnly))
-                return ERR_FILE_OPEN;
-
-            file.write(model->header(index));
-            file.close();
-        }
-
-        if (!model->body(index).isEmpty()) {
-            file.setFileName(QObject::tr("%1/body.bin").arg(path));
-            if (!file.open(QFile::WriteOnly))
-                return ERR_FILE_OPEN;
-
-            file.write(model->body(index));
-            file.close();
-        }
-
-        QString info = QObject::tr("Type: %1\nSubtype: %2\n%3%4\n")
-            .arg(itemTypeToQString(model->type(index)))
-            .arg(itemSubtypeToQString(model->type(index), model->subtype(index)))
-            .arg(model->text(index).isEmpty() ? QObject::tr("") : QObject::tr("Text: %1\n").arg(model->text(index)))
-            .arg(model->info(index));
-        file.setFileName(QObject::tr("%1/info.txt").arg(path));
-        if (!file.open(QFile::Text | QFile::WriteOnly))
-            return ERR_FILE_OPEN;
-
-        file.write(info.toLatin1());
-        file.close();
-        dumped = true;
+    if (changeDirectory(path)) {
+        printf("Directory \"%s\" already exists.\n", (const char*)path.toLocal8Bit());
+        return U_DIR_ALREADY_EXIST;
     }
 
-    UINT8 result;
+    currentPath = path;
+
+    USTATUS result = recursiveDump(root, path, dumpMode, sectionType, guid);
+    if (result) {
+        printf("Error %zu returned from recursiveDump (directory \"%s\").\n", result, (const char*)path.toLocal8Bit());
+        return result;
+    } else if (!dumped) {
+        if (removeDirectory(path)) {
+            printf("Removed directory \"%s\" since nothing was dumped.\n", (const char*)path.toLocal8Bit());
+        }
+        return U_ITEM_NOT_FOUND;
+    }
+
+    return U_SUCCESS;
+}
+
+USTATUS FfsDumper::recursiveDump(const UModelIndex & index, const UString & path, const DumpMode dumpMode, const UINT8 sectionType, const UString & guid)
+{
+    if (!index.isValid())
+        return U_INVALID_PARAMETER;
+
+    if (guid.isEmpty() ||
+        (model->subtype(index) == EFI_SECTION_FREEFORM_SUBTYPE_GUID &&
+            guidToUString(readUnaligned((const EFI_GUID*)(model->header(index).constData() + sizeof(EFI_COMMON_SECTION_HEADER)))) == guid) ||
+        guidToUString(readUnaligned((const EFI_GUID*)model->header(index).constData())) == guid ||
+        guidToUString(readUnaligned((const EFI_GUID*)model->header(model->findParentOfType(index, Types::File)).constData())) == guid) {
+
+        if (!changeDirectory(path) && !makeDirectory(path)) {
+            printf("Cannot use directory \"%s\" (recursiveDump part 1).\n", (const char*)path.toLocal8Bit());
+            return U_DIR_CREATE;
+        }
+
+        if (currentPath != path) {
+            counterHeader = counterBody = counterUncData = counterRaw = counterInfo = 0;
+            currentPath = path;
+        }
+
+        if (fileList.count(index) == 0
+            && (dumpMode == DUMP_ALL || model->rowCount(index) == 0)
+            && (sectionType == IgnoreSectionType || model->subtype(index) == sectionType)) {
+
+            if ((dumpMode == DUMP_ALL || dumpMode == DUMP_CURRENT || dumpMode == DUMP_HEADER)
+                && !model->hasEmptyHeader(index)) {
+                fileList.insert(index);
+
+                UString filename;
+                if (counterHeader == 0)
+                    filename = usprintf("%s/header.bin", path.toLocal8Bit());
+                else
+                    filename = usprintf("%s/header_%d.bin", path.toLocal8Bit(), counterHeader);
+                counterHeader++;
+
+                std::ofstream file(filename.toLocal8Bit(), std::ofstream::binary);
+                if (!file) {
+                    printf("Cannot open header \"%s\".\n", (const char*)filename.toLocal8Bit());
+                    return U_FILE_OPEN;
+                }
+
+                const UByteArray &data = model->header(index);
+                file.write(data.constData(), data.size());
+
+                dumped = true;
+            }
+
+            if ((dumpMode == DUMP_ALL || dumpMode == DUMP_CURRENT || dumpMode == DUMP_BODY)
+                && !model->hasEmptyBody(index)) {
+                fileList.insert(index);
+                UString filename;
+                if (counterBody == 0)
+                    filename = usprintf("%s/body.bin", path.toLocal8Bit());
+                else
+                    filename = usprintf("%s/body_%d.bin", path.toLocal8Bit(), counterBody);
+                counterBody++;
+
+                std::ofstream file(filename.toLocal8Bit(), std::ofstream::binary);
+                if (!file) {
+                    printf("Cannot open body \"%s\".\n", (const char*)filename.toLocal8Bit());
+                    return U_FILE_OPEN;
+                }
+
+                const UByteArray &data = model->body(index);
+                file.write(data.constData(), data.size());
+
+                dumped = true;
+            }
+
+            if ((dumpMode == DUMP_ALL || dumpMode == DUMP_CURRENT || dumpMode == DUMP_UNC_DATA)
+                && !model->hasEmptyUncompressedData(index)) {
+                fileList.insert(index);
+                UString filename;
+                if (counterUncData == 0)
+                    filename = usprintf("%s/unc_data.bin", path.toLocal8Bit());
+                else
+                    filename = usprintf("%s/unc_data_%d.bin", path.toLocal8Bit(), counterUncData);
+                counterUncData++;
+
+                std::ofstream file(filename.toLocal8Bit(), std::ofstream::binary);
+                if (!file) {
+                    printf("Cannot open uncompressed data \"%s\".\n", (const char*)filename.toLocal8Bit());
+                    return U_FILE_OPEN;
+                }
+
+                const UByteArray &data = model->uncompressedData(index);
+                file.write(data.constData(), data.size());
+
+                dumped = true;
+            }
+            
+            if (dumpMode == DUMP_FILE) {
+                UModelIndex fileIndex = index;
+                if (model->type(fileIndex) != Types::File) {
+                    fileIndex = model->findParentOfType(index, Types::File);
+                    if (!fileIndex.isValid())
+                        fileIndex = index;
+                }
+
+                // We may select parent file during ffs extraction.
+                if (fileList.count(fileIndex) == 0) {
+                    fileList.insert(fileIndex);
+
+                    UString filename;
+                    if (counterRaw == 0)
+                        filename = usprintf("%s/file.ffs", path.toLocal8Bit());
+                    else
+                        filename = usprintf("%s/file_%d.ffs", path.toLocal8Bit(), counterRaw);
+                    counterRaw++;
+
+                    std::ofstream file(filename.toLocal8Bit(), std::ofstream::binary);
+                    if (!file) {
+                        printf("Cannot open file \"%s\".\n", (const char*)filename.toLocal8Bit());
+                        return U_FILE_OPEN;
+                    }
+
+                    const UByteArray &headerData = model->header(fileIndex);
+                    const UByteArray &bodyData = model->body(fileIndex);
+                    const UByteArray &tailData = model->tail(fileIndex);
+
+                    file.write(headerData.constData(), headerData.size());
+                    file.write(bodyData.constData(), bodyData.size());
+                    file.write(tailData.constData(), tailData.size());
+
+                    dumped = true;
+                }
+            }
+        }
+
+        // Always dump info unless explicitly prohibited
+        if ((dumpMode == DUMP_ALL || dumpMode == DUMP_CURRENT || dumpMode == DUMP_INFO)
+            && (sectionType == IgnoreSectionType || model->subtype(index) == sectionType)) {
+            UString info = usprintf("Type: %s\nSubtype: %s\n%s%s\n",
+                itemTypeToUString(model->type(index)).toLocal8Bit(),
+                itemSubtypeToUString(model->type(index), model->subtype(index)).toLocal8Bit(),
+                (model->text(index).isEmpty() ? UString("") :
+                    usprintf("Text: %s\n", model->text(index).toLocal8Bit())).toLocal8Bit(),
+                model->info(index).toLocal8Bit());
+
+            UString filename;
+            if (counterInfo == 0)
+                filename = usprintf("%s/info.txt", path.toLocal8Bit());
+            else
+                filename = usprintf("%s/info_%d.txt", path.toLocal8Bit(), counterInfo);
+            counterInfo++;
+
+            std::ofstream file(filename.toLocal8Bit());
+            if (!file) {
+                printf("Cannot open info \"%s\".\n", (const char*)filename.toLocal8Bit());
+                return U_FILE_OPEN;
+            }
+
+            file << info.toLocal8Bit();
+
+            dumped = true;
+        }
+    }
+
+    USTATUS result;
+
     for (int i = 0; i < model->rowCount(index); i++) {
-        QModelIndex childIndex = index.child(i, 0);
+        UModelIndex childIndex = index.child(i, 0);
         bool useText = FALSE;
         if (model->type(childIndex) != Types::Volume)
             useText = !model->text(childIndex).isEmpty();
 
-        QString childPath = QString("%1/%2 %3").arg(path).arg(i).arg(useText ? model->text(childIndex) : model->name(childIndex));
-        result = recursiveDump(childIndex, childPath, guid);
-        if (result)
+        UString childPath = path;
+        if (dumpMode == DUMP_ALL || dumpMode == DUMP_CURRENT) {
+            if (!changeDirectory(path) && !makeDirectory(path)) {
+                printf("Cannot use directory \"%s\" (recursiveDump part 2).\n", (const char*)path.toLocal8Bit());
+                return U_DIR_CREATE;
+            }
+
+            UString name = usprintf("%d %s", i, (useText ? model->text(childIndex) : model->name(childIndex)).toLocal8Bit());
+            fixFileName (name, false);
+            childPath = usprintf("%s/%s", path.toLocal8Bit(), name.toLocal8Bit());
+        }
+        result = recursiveDump(childIndex, childPath, dumpMode, sectionType, guid);
+        if (result) {
+            printf("Error %zu returned from recursiveDump (child directory \"%s\").\n", result, (const char*)childPath.toLocal8Bit());
             return result;
+        }
     }
 
-    return ERR_SUCCESS;
+    return U_SUCCESS;
 }

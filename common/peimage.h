@@ -16,10 +16,10 @@ WITHOUT WARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
 #ifndef PEIMAGE_H
 #define PEIMAGE_H
 
-#include <QString>
 #include "basetypes.h"
+#include "ustring.h"
 
-extern QString machineTypeToQString(UINT16 machineType);
+extern UString machineTypeToUString(UINT16 machineType);
 
 // Make sure we use right packing rules
 #pragma pack(push, 1)
@@ -45,10 +45,13 @@ extern QString machineTypeToQString(UINT16 machineType);
 #define EFI_IMAGE_FILE_MACHINE_IA64           0x0200 // Itanium
 #define EFI_IMAGE_FILE_MACHINE_EBC            0x0ebc // EFI Byte Code
 #define EFI_IMAGE_FILE_MACHINE_AMD64          0x8664 // x86-64
-#define EFI_IMAGE_FILE_MACHINE_AARCH64        0xaa64 // ARMv8 in 64-bit mode 
+#define EFI_IMAGE_FILE_MACHINE_AARCH64        0xaa64 // ARMv8 in 64-bit mode
 #define EFI_IMAGE_FILE_MACHINE_RISCV32        0x5032 // RISC-V 32-bit
 #define EFI_IMAGE_FILE_MACHINE_RISCV64        0x5064 // RISC-V 64-bit
-#define EFI_IMAGE_FILE_MACHINE_RISCV128       0x5128 // RISC-V 128-bit
+#define EFI_IMAGE_FILE_MACHINE_RISCV128       0x5128 // RISC-V 128-bit
+#define EFI_IMAGE_FILE_MACHINE_LOONGARCH32    0x6232 // LoongArch 32-bit
+#define EFI_IMAGE_FILE_MACHINE_LOONGARCH64    0x6264 // LoongArch 64-bit
+
 //
 // EXE file formats
 //
@@ -469,7 +472,8 @@ typedef struct {
 //
 #define EFI_IMAGE_REL_BASED_RISCV_HI20  0x0005
 #define EFI_IMAGE_REL_BASED_RISCV_LO12I 0x0007
-#define EFI_IMAGE_REL_BASED_RISCV_LO12S 0x0008
+#define EFI_IMAGE_REL_BASED_RISCV_LO12S 0x0008
+
 
 //
 // Based relocation format
@@ -584,8 +588,8 @@ typedef struct {
 } EFI_IMAGE_THUNK_DATA;
 
 #define EFI_IMAGE_ORDINAL_FLAG              0x80000000 // Flag for PE32.
-#define EFI_IMAGE_SNAP_BY_ORDINAL(Ordinal)  ((Ordinal & EFI_IMAGE_ORDINAL_FLAG) != 0)
-#define EFI_IMAGE_ORDINAL(Ordinal)          (Ordinal & 0xffff)
+#define EFI_IMAGE_SNAP_BY_ORDINAL(Ordinal)  (((Ordinal) & EFI_IMAGE_ORDINAL_FLAG) != 0)
+#define EFI_IMAGE_ORDINAL(Ordinal)          ((Ordinal) & 0xffff)
 
 //
 // Import Directory Table
@@ -725,6 +729,11 @@ typedef struct {
 } EFI_IMAGE_TE_HEADER;
 
 #define EFI_IMAGE_TE_SIGNATURE  0x5A56 // VZ
+
+// Image base types
+#define EFI_IMAGE_TE_BASE_OTHER    0
+#define EFI_IMAGE_TE_BASE_ORIGINAL 1
+#define EFI_IMAGE_TE_BASE_ADJUSTED 2
 
 //
 // Data directory indexes in our TE image header

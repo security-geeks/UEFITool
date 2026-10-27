@@ -14,19 +14,15 @@ WITHOUT WARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
 #ifndef UEFIFIND_H
 #define UEFIFIND_H
 
+#include <iterator>
 #include <set>
 
-#include <QObject>
-#include <QByteArray>
-#include <QString>
-#include <QDir>
-#include <QFileInfo>
-#include <QString>
-#include <QUuid>
-
 #include "../common/basetypes.h"
+#include "../common/ustring.h"
+#include "../common/filesystem.h"
 #include "../common/ffsparser.h"
 #include "../common/ffs.h"
+#include "../common/utility.h"
 
 class UEFIFind
 {
@@ -34,16 +30,14 @@ public:
     explicit UEFIFind();
     ~UEFIFind();
 
-    STATUS init(const QString & path);
-    STATUS find(const UINT8 mode, const bool count, const QString & hexPattern, QString & result);
+    USTATUS init(const UString & path);
+    USTATUS find(const UINT8 mode, const bool count, const UString & hexPattern, UString & result);
 
 private:
-    STATUS findFileRecursive(const QModelIndex index, const QString & hexPattern, const UINT8 mode, std::set<std::pair<QModelIndex, QModelIndex> > & files);
-    QString guidToQString(const UINT8* guid);
+    USTATUS findFileRecursive(const UModelIndex index, const UString & hexPattern, const UINT8 mode, std::set<std::pair<UModelIndex, UModelIndex> > & files);
 
     FfsParser* ffsParser;
     TreeModel* model;
-    QFileInfo fileInfo;
     bool initDone;
 };
 

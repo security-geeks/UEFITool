@@ -14,33 +14,81 @@ WITHOUT WARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
 #ifndef UTILITY_H
 #define UTILITY_H
 
-#include <QString>
-#include <QModelIndex>
+#include <vector>
+
+#include "../common/zlib/zlib.h"
+
+#include "../common/brotli/include/brotli/decode.h"
+
 #include "basetypes.h"
+#include "ustring.h"
+#include "treemodel.h"
 #include "parsingdata.h"
 
-// Returns either new parsing data instance or obtains it from index
-PARSING_DATA parsingDataFromQModelIndex(const QModelIndex & index);
+// Returns text representation of 4CC value
+UString fourCC(const UINT32 value);
 
-// Converts parsing data to byte array
-QByteArray parsingDataToQByteArray(const PARSING_DATA & pdata);
+// Returns bytes as string when all bytes are ascii visible, hex representation otherwise
+UString visibleAsciiOrHex(UINT8* bytes, UINT32 length);
 
-// Converts error code to QString
-extern QString errorCodeToQString(UINT8 errorCode);
+// Returns unique name for tree item
+UString uniqueItemName(const UModelIndex & index);
 
-// Decompression routine
-extern STATUS decompress(const QByteArray & compressed, UINT8 & algorithm, QByteArray & decompressed, QByteArray & efiDecompressed);
+// Makes the name usable as a file name
+void fixFileName(UString &name, bool replaceSpaces);
 
-// Compression routine
-//STATUS compress(const QByteArray & decompressed, QByteArray & compressed, const UINT8 & algorithm);
+// Converts error code to UString
+UString errorCodeToUString(USTATUS errorCode);
 
-// CRC32 calculation routine
-extern UINT32 crc32(UINT32 initial, const UINT8* buffer, const UINT32 length);
+// EFI/Tiano/LZMA decompression routine
+USTATUS decompress(const UByteArray & compressed, const UINT8 compressionType, UINT8 & algorithm, UINT32 & dictionarySize, UByteArray & decompressed, UByteArray & efiDecompressed);
+
+// GZIP decompression routine
+USTATUS gzipDecompress(const UByteArray & compressed, UByteArray & decompressed);
+
+// ZLIB decompression routine
+USTATUS zlibDecompress(const UByteArray& compressed, UByteArray& decompressed);
+
+// Brotli decompression routine
+USTATUS brotliDecompress(const UByteArray& compressed, UByteArray& decompressed);
+
+// 8bit sum calculation routine
+UINT8 calculateSum8(const UINT8* buffer, UINT32 bufferSize);
 
 // 8bit checksum calculation routine
-extern UINT8 calculateChecksum8(const UINT8* buffer, UINT32 bufferSize);
+UINT8 calculateChecksum8(const UINT8* buffer, UINT32 bufferSize);
 
 // 16bit checksum calculation routine
-extern UINT16 calculateChecksum16(const UINT16* buffer, UINT32 bufferSize);
+UINT16 calculateChecksum16(const UINT16* buffer, UINT32 bufferSize);
+
+// 32bit checksum calculation routine
+UINT32 calculateChecksum32(const UINT32* buffer, UINT32 bufferSize);
+
+// Returns 0x00..0xFF if an array is filled by a single repeated value, and 0xFFFFFFFF if not
+UINT32 uniformByte(const UByteArray& a, const UINT32 rcIfEmpty = UINT32_MAX);
+
+// Returns true if an array is filled by a specified single repeated value or an array is empty
+UINT32 isUniformByte(const UByteArray& a, const UINT8 value);
+
+// Returns padding type from it's contents
+UINT8 getPaddingType(const UByteArray & padding);
+
+// Make pattern from a hexstring with an assumption of . being any char
+bool makePattern(const CHAR8 *textPattern, std::vector<UINT8> &pattern, std::vector<UINT8> &patternMask);
+
+// Find pattern in a binary blob
+INTN findPattern(const UINT8 *pattern, const UINT8 *patternMask, UINTN patternSize,
+    const UINT8 *data, UINTN dataSize, UINTN dataOff);
+
+// Safely dereferences misaligned pointers
+template <typename T>
+inline T readUnaligned(const T *v) {
+    T tmp = {};
+    memcpy(reinterpret_cast<void*>(&tmp), reinterpret_cast<const void*>(v), sizeof(T));
+    return tmp;
+}
+
+// Fletcher checksum calculation routine
+UINT32 fletcher32(const UByteArray& img);
 
 #endif // UTILITY_H
